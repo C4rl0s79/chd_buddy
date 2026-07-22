@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chd-buddy"
+version = "0.2.0"
+description = "Audyt, konwersja i bezpieczna naprawa plików CHD (emulacja) — z wykrywaniem błędnego typu nośnika i trybem low-disk."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Karol" }]
+dependencies = []
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+archives = ["py7zr>=0.21"]
+icons = ["Pillow>=10.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+chd-buddy = "chd_buddy.cli:main"
+
+[project.gui-scripts]
+chd-buddy-gui = "chd_buddy.main:main"
+chd-buddy-suite = "chd_buddy.suite:main"
+
+[tool.setuptools.packages.find]
+include = ["chd_buddy*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

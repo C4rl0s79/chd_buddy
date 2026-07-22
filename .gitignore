@@ -1,0 +1,40 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# --- Artefakty runtime CHD Buddy (nie należą do drzewa źródeł) ---
+# Trwały indeks plików (SQLite) — generowany obok exe/projektu.
+chd_buddy_index.sqlite3
+*.sqlite3
+# Cache parsowania DAT-ów i stanu raportu.
+*.pkl
+dat_parse_cache.pkl
+report_state_cache.pkl
+# Crash-log (w trybie dev idzie do temp; ten wpis łapie starsze wersje).
+chd_buddy_crash.log
+*.log
+# Cache miniatur/ikon pobieranych z sieci.
+libretro_cache/
+
+# --- Ustawienia lokalne (przenośne — obok exe, nie w repo) ---
+chd_buddy_settings.json
+emu_versions.json
+
+# --- Claude Code (lokalne ustawienia per-użytkownik) ---
+.claude/settings.local.json
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

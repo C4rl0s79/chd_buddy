@@ -1,0 +1,12 @@
+# Normalizacja końców linii: w repo zawsze LF, checkout wg platformy.
+* text=auto eol=lf
+
+# Pliki binarne — bez normalizacji.
+*.png binary
+*.ico binary
+*.jpg binary
+*.7z binary
+*.zip binary
+*.chd binary
+*.sqlite3 binary
+*.pkl binary

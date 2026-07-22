@@ -1,0 +1,17 @@
+# Rdzeń i CLI nie mają zależności zewnętrznych (tylko stdlib).
+# GUI:
+PySide6>=6.6
+
+# Opcjonalne — rozpakowywanie archiwów źródłowych:
+py7zr>=0.21        # .7z / .zip
+# patool + unrar-tool wymagane dla .rar (opcjonalnie):
+# patool>=2.0
+
+# Opcjonalne — szybki odczyt metadanych CHD bez spawnu procesu.
+# UWAGA: to rozszerzenie w Ruście publikowane tylko jako sdist (brak wheeli) —
+# wymaga toolchainu Cargo/Rust i często nie kompiluje się pod najnowsze Pythony.
+# NIEZALECANE: aplikacja czyta metadane przez `chdman info`. Pomiń.
+# chd-rs-py
+
+# Dev:
+pytest>=8.0
