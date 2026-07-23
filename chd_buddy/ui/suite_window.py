@@ -1825,7 +1825,8 @@ class SuiteWindow(QMainWindow):
                     cst0, converted_games, src_to_purge = convert_from_source(
                         reports, rules.for_entry, _make_tools(), index=idx,
                         dry_run=dry, log=log, cancel=cancel, detail=detail,
-                        on_progress=progress, on_converted=rb.add_canonical)
+                        on_progress=progress, on_converted=rb.add_canonical,
+                        delete_roots=del_from)
                     log(f"Konwersja ze źródła: {cst0.summary()} "
                         f"({len(converted_games)} gier na RAM, docelowy dostał "
                         f"tylko finał).")

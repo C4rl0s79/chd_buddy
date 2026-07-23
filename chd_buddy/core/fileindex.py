@@ -59,7 +59,6 @@ CREATE TABLE IF NOT EXISTS files (
     deep_fail INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
-CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
 CREATE INDEX IF NOT EXISTS idx_files_data_sha1 ON files(data_sha1);
 CREATE TABLE IF NOT EXISTS members (
@@ -590,13 +589,6 @@ class FileIndex:
             )]
             groups.append(DupGroup(sha1=r["sha1"], size=r["size"], paths=paths))
         return groups
-
-    def find_md5(self, md5: str) -> list[sqlite3.Row]:
-        """Pliki o danym MD5 (fallback, gdy DAT nie ma SHA-1)."""
-        return self._db.execute(
-            "SELECT * FROM files WHERE missing=0 AND md5=?",
-            (md5.lower(),),
-        ).fetchall()
 
     def find_crc(self, crc32: str, size: int) -> list[sqlite3.Row]:
         """Pliki o danym CRC32 i rozmiarze (fallback, gdy DAT nie ma SHA-1)."""

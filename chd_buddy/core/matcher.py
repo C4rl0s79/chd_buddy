@@ -210,7 +210,8 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
     if rom.sha1:
         rows = index.find_sha1(rom.sha1, include_chd_content=False)
     if not rows and rom.md5:
-        rows = index.find_md5(rom.md5)
+        rows = [r for r in index._db.execute(
+            "SELECT * FROM files WHERE missing=0 AND md5=?", (rom.md5.lower(),))]
     if not rows and rom.crc and rom.size:
         rows = index.find_crc(rom.crc, rom.size)
     if not rows and not (rom.sha1 or rom.md5 or rom.crc):

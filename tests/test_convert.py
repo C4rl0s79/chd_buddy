@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import zipfile
 from pathlib import Path
 
@@ -207,12 +208,54 @@ def test_convert_from_source_loose_to_zip(tmp_path: Path, monkeypatch):
         assert z.read("Gra (USA).nes") == data
     assert not (target / "Gra (USA).nes").exists()   # docelowy NIE dostał luźnego
     assert done                                      # gra oznaczona (placement pominie)
-    # źródło NIE skasowane od razu — zwrócone do zbiorczego kasowania na końcu
-    assert src.exists() and src in to_purge
-    from chd_buddy.core.convert import purge_source_files
-    purge_source_files(to_purge, index=idx)
-    assert not src.exists()                          # skasowane na końcu
+    # źródło UNIKALNE (jednopłytowe) → skasowane OD RAZU, nie odroczone
+    assert not src.exists()
+    assert src not in to_purge and not to_purge
     assert not any(scratch.iterdir())                # nic nie zostało na scratchu
+
+
+def test_convert_from_source_defers_only_shared(tmp_path: Path, monkeypatch):
+    """Źródło WSPÓŁDZIELONE przez 2 gry (ta sama ścieżka audio) → odroczone
+    (w to_purge, kasowane dopiero purge); UNIKALNE ścieżki → kasowane od razu."""
+    import chd_buddy.core.scratch as sc
+    from chd_buddy.core.convert import convert_from_source, purge_source_files
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"; tosort = tmp_path / "ts"
+    scratch = tmp_path / "ram"; scratch.mkdir()
+    monkeypatch.setattr(sc, "pick_scratch_root",
+                        lambda need, prefer=None, log=None, fallback=None: scratch)
+    shared = b"WSPOLNE-AUDIO" * 300        # identyczna ścieżka w obu grach
+    uniq1 = b"DANE-DISC-1" * 300
+    uniq2 = b"DANE-DISC-2" * 300
+    _write_dat(dat_root / "ps.dat", "Sony - PlayStation",
+               {"Gra (Disc 1)": {"Gra (Disc 1) (Track 1).bin": uniq1,
+                                 "Gra (Track 2).bin": shared},
+                "Gra (Disc 2)": {"Gra (Disc 2) (Track 1).bin": uniq2,
+                                 "Gra (Track 2).bin": shared}})
+    tosort.mkdir()
+    (tosort / "Gra (Disc 1) (Track 1).bin").write_bytes(uniq1)
+    (tosort / "Gra (Disc 2) (Track 1).bin").write_bytes(uniq2)
+    shared_src = tosort / "Gra (Track 2).bin"
+    shared_src.write_bytes(shared)         # JEDEN plik, dopasowany przez obie gry
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tosort)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+
+    def rules_fn(e):
+        from chd_buddy.core.dirrules import DEFAULT_RULES
+        r = dict(DEFAULT_RULES); r["format"] = "zip"; return r
+
+    st, done, to_purge = convert_from_source(reports, rules_fn,
+                                             {"settings": None}, index=idx)
+    assert st.converted == 2
+    # unikalne ścieżki obu dysków skasowane od razu
+    assert not (tosort / "Gra (Disc 1) (Track 1).bin").exists()
+    assert not (tosort / "Gra (Disc 2) (Track 1).bin").exists()
+    # WSPÓŁDZIELONA ścieżka JESZCZE istnieje (odroczona) i jest w to_purge
+    assert shared_src.exists()
+    assert any(os.path.normcase(str(p)) == os.path.normcase(str(shared_src))
+               for p in to_purge)
+    purge_source_files(to_purge, index=idx)
+    assert not shared_src.exists()          # skasowana dopiero na końcu
 
 
 def test_convert_from_source_verifies_and_skips_on_mismatch(tmp_path, monkeypatch):
@@ -246,6 +289,43 @@ def test_convert_from_source_verifies_and_skips_on_mismatch(tmp_path, monkeypatc
     assert not (rom_root / "Nintendo - Nintendo Entertainment System"
                 / "Gra (USA).zip").exists()
     assert src.exists()                          # źródło nietknięte (fallback)
+
+
+def test_purge_redundant_tosort_tracks(tmp_path: Path):
+    """Gra JUŻ zrobiona na CHD (w docelowym) — jej luźne ścieżki wciąż w ToSort
+    są kasowane; ale SHA-1 potrzebne NIEzaspokojonej grze są chronione."""
+    from chd_buddy.core.convert import _purge_redundant_tosort_tracks
+    dat_root = tmp_path / "dats"
+    tosort = tmp_path / "ts"
+    data = b"SCIEZKA-DANE" * 100
+    _write_dat(dat_root / "ps.dat", "Sony - PlayStation",
+               {"Gra": {"Gra.bin": data}})
+    tosort.mkdir()
+    loose = tosort / "Gra.bin"
+    loose.write_bytes(data)                       # luźna kopia w ToSort
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tosort)
+    game = DatStore(dat_root, tmp_path / "roms").discover()[0].load().games[0]
+    del_pref = [os.path.normcase(str(tosort)).rstrip("\\/") + os.sep]
+    sha1 = game.roms[0].sha1.lower()
+
+    # CHRONIONE: SHA-1 potrzebne niezaspokojonej grze → nie kasuj
+    n = _purge_redundant_tosort_tracks(game, idx, del_pref, {sha1},
+                                       lambda m: None)
+    assert n == 0 and loose.exists()
+
+    # bez ochrony → skasowane z ToSort
+    n = _purge_redundant_tosort_tracks(game, idx, del_pref, set(),
+                                       lambda m: None)
+    assert n == 1 and not loose.exists()
+
+    # plik POZA ToSort (inny prefix) — nietykalny
+    other = tmp_path / "gdzie_indziej"
+    other.mkdir()
+    (other / "Gra.bin").write_bytes(data)
+    idx.scan(other)
+    n = _purge_redundant_tosort_tracks(game, idx, del_pref, set(),
+                                       lambda m: None)
+    assert n == 0 and (other / "Gra.bin").exists()
 
 
 def test_convert_reports_auto_format(tmp_path: Path):

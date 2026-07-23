@@ -190,10 +190,13 @@ class ConvertStats:
     converted: int = 0
     skipped: int = 0
     errors: int = 0
+    tosort_purged: int = 0      # luźne ścieżki gier już-na-CHD skasowane z ToSort
 
     def summary(self) -> str:
+        extra = (f", ToSort posprzątane {self.tosort_purged}"
+                 if self.tosort_purged else "")
         return (f"skonwertowano {self.converted}, pominięto {self.skipped}, "
-                f"błędy {self.errors}")
+                f"błędy {self.errors}{extra}")
 
 
 def convert_reports(reports, rules_fn, tools: dict, index=None, *,
@@ -244,7 +247,8 @@ def convert_reports(reports, rules_fn, tools: dict, index=None, *,
             if _convert_one(files, rep.entry.target_dir, base, fmt, subdir,
                             len(game.roms), tools, index, dry_run, log, st,
                             detail=detail, on_converted=on_converted,
-                            deferred=deferred, deferred_dirs=deferred_dirs):
+                            deferred=deferred, deferred_dirs=deferred_dirs,
+                            game=game):
                 st.converted += 1
     # DOPIERO TERAZ kasujemy źródła (wszystkie płyty zestawów już skonwertowane)
     if deferred and not dry_run:
@@ -353,10 +357,37 @@ def _gather_track_to_ram(status, ram_dir: Path, log: LogCB) -> Optional[Path]:
     return dst
 
 
+def _purge_redundant_tosort_tracks(game, index, del_prefixes, needed_sha1,
+                                   log: LogCB) -> int:
+    """Kasuje z ToSort luźne pliki będące ścieżkami gry JUŻ zrobionej na CHD
+    (w docelowym). Chroni SHA-1 potrzebne innym, niezaspokojonym grom
+    (`needed_sha1`) oraz nie rusza symlinków. Zwraca ile skasowano."""
+    n = 0
+    for rom in game.roms:
+        sha1 = (rom.sha1 or "").lower()
+        if not sha1 or sha1 in needed_sha1:
+            continue                          # potrzebne innej grze — zostaw
+        for row in index.find_sha1(sha1, include_chd_content=False):
+            p = row["path"]
+            np = os.path.normcase(p)
+            if not any(np.startswith(dp) for dp in del_prefixes):
+                continue                      # nie w ToSort — nie ruszamy
+            if row["is_link"] or row["missing"]:
+                continue
+            try:
+                os.unlink(p)
+                index.remove_path(p)
+                n += 1
+                log(f"KASUJ z ToSort (gra już na CHD): {p}")
+            except OSError as e:
+                log(f"  nie skasowano {p}: {e}")
+    return n
+
+
 def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
                         dry_run: bool = False, log: LogCB = lambda m: None,
                         cancel=None, on_progress=None, detail=None,
-                        on_converted=None):
+                        on_converted=None, delete_roots=None):
     """Konwersja PROSTO ZE ŹRÓDŁA na RAM → w docelowym ląduje TYLKO finał.
 
     Dla gier, których źródłem są luźne pliki albo ścieżki w archiwum (ToSort),
@@ -379,7 +410,37 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
 
     st = ConvertStats()
     done: set = set()
-    deferred: list = []                       # ORYGINALNE źródła (kasuj po całości)
+    deferred: list = []                       # WSPÓŁDZIELONE źródła (kasuj po całości)
+    # Które źródła są WSPÓŁDZIELONE przez >1 grę (np. ścieżka audio dzielona
+    # przez płyty zestawu, albo plik potrzebny też grze idącej do fallbacku)?
+    # Takie kasujemy DOPIERO na końcu. Unikalne (jednopłytowe) — od razu po
+    # konwersji, żeby ToSort zwalniał się w trakcie długiej naprawy.
+    from collections import defaultdict
+    _games_by_src: dict = defaultdict(set)
+    for _rep in reports:
+        for _s in _rep.statuses:
+            if _s.source_path:
+                _games_by_src[os.path.normcase(_s.source_path)].add(
+                    (id(_rep.entry), _s.game))
+    shared_srcs = {src for src, gs in _games_by_src.items() if len(gs) > 1}
+    # SHA-1 ścieżek potrzebnych przez gry NIEzaspokojone (choć jeden ROM nie na
+    # miejscu) — takich luźnych plików NIE wolno skasować z ToSort, nawet jeśli
+    # są też ścieżką gry już zrobionej na CHD (inna gra ich jeszcze potrzebuje).
+    _needed_sha1: set = set()
+    for _rep in reports:
+        _bg: dict = defaultdict(list)
+        for _s in _rep.statuses:
+            _bg[_s.game].append(_s)
+        for _sts in _bg.values():
+            unsat = any(_s.state in (RomState.ELSEWHERE, RomState.WRONG_NAME,
+                                     RomState.MISSING, RomState.NO_HASH)
+                        for _s in _sts)
+            if unsat:
+                for _s in _sts:
+                    if _s.rom.sha1:
+                        _needed_sha1.add(_s.rom.sha1.lower())
+    del_prefixes = [os.path.normcase(str(Path(os.path.abspath(r)))).rstrip("\\/")
+                    + os.sep for r in (delete_roots or []) if r]
     n_total = sum(len(r.entry.games) for r in reports) or 1
     gi = 0
     for rep in reports:
@@ -410,15 +471,30 @@ def convert_from_source(reports, rules_fn, tools: dict, index=None, *,
             if any(s.state in (RomState.MISSING, RomState.NO_HASH) for s in sts):
                 continue
             if any(s.via_chd or s.via_archive for s in sts):
+                # źródło/wynik to CHD lub całe archiwum — konwersji nie robimy.
+                # ALE gdy CHD jest JUŻ w docelowym (HAVE_CHD), a luźne ścieżki
+                # tej gry wciąż leżą w ToSort — posprzątaj je (redundantne).
+                if (del_prefixes and index is not None and not dry_run
+                        and all(s.state in (RomState.HAVE, RomState.HAVE_CHD)
+                                for s in sts)
+                        and any(s.state == RomState.HAVE_CHD for s in sts)):
+                    st.tosort_purged += _purge_redundant_tosort_tracks(
+                        game, index, del_prefixes, _needed_sha1, log)
                 continue
             if all(s.state in (RomState.HAVE, RomState.HAVE_CHD) for s in sts):
+                # zaspokojona bez konwersji (np. już luźna w docelowym) — jeśli
+                # przez CHD i luźne kopie leżą w ToSort, też posprzątaj
+                if (del_prefixes and index is not None and not dry_run
+                        and any(s.state == RomState.HAVE_CHD for s in sts)):
+                    st.tosort_purged += _purge_redundant_tosort_tracks(
+                        game, index, del_prefixes, _needed_sha1, log)
                 continue
             if on_progress:
                 on_progress(gi, n_total, f"konwersja (ze źródła): {game.name}")
             key = f"{id(rep.entry)}::{game.name}"
             if _convert_game_from_source(rep.entry, game, sts, fmt, subdir,
                                          tools, index, dry_run, log, st, detail,
-                                         deferred, on_converted):
+                                         deferred, on_converted, shared_srcs):
                 done.add(key)
 
     # NIE kasujemy tu — oryginalne źródła (unikalne) zwracamy, a kasuje je
@@ -452,9 +528,13 @@ def purge_source_files(paths, index=None, log: LogCB = lambda m: None,
 
 def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
                               dry_run, log, st, detail, deferred,
-                              on_converted) -> bool:
+                              on_converted, shared_srcs=frozenset()) -> bool:
     """Jedna gra: zbierz ścieżki na RAM → kompresuj → weryfikuj → finał do
-    docelowego. True gdy obsłużona (placement ją pomija)."""
+    docelowego. True gdy obsłużona (placement ją pomija).
+
+    Źródła UNIKALNE dla tej gry kasujemy OD RAZU (ToSort zwalnia się w trakcie);
+    WSPÓŁDZIELONE (`shared_srcs`) dopisujemy do `deferred` — kasowane na końcu,
+    bo potrzebuje ich inna płyta zestawu / gra idąca do fallbacku."""
     import shutil as _sh
     import tempfile
     from .scratch import pick_scratch_root
@@ -557,16 +637,40 @@ def _convert_game_from_source(entry, game, sts, fmt, subdir, tools, index,
             try:
                 crc, md5, sha1 = hash_file(final)
                 index.record_file(final, crc, md5, sha1)
+                # CHD: zapisz ODCISK ZAWARTOŚCI (game_profile) = ten sam, który
+                # liczy matcher (by_profile). Bez tego następny skan musiałby
+                # WYPAKOWAĆ CHD, żeby go zidentyfikować (kosztowne, niepotrzebne).
+                if fmt == "chd":
+                    from .datfile import game_profile
+                    prof = game_profile(game.data_roms)
+                    if prof:
+                        index.set_data_sha1(final, prof)
             except OSError:
                 pass
         if on_converted is not None:
             on_converted(final)
         st.converted += 1
-        # ORYGINALNE źródła → do skasowania po WSZYSTKICH grach
+        # ORYGINALNE źródła: UNIKALNE dla tej gry → kasuj OD RAZU (ToSort
+        # zwalnia się w trakcie); WSPÓŁDZIELONE → odrocz do końca (inna płyta
+        # /fallback jeszcze ich potrzebuje). Dedup po ścieżce w obrębie gry.
+        seen: set = set()
         for r in roms:
             sp = st_by_rom[r.name].source_path
-            if sp:
+            if not sp:
+                continue
+            npath = os.path.normcase(str(sp))
+            if npath in seen:
+                continue
+            seen.add(npath)
+            if npath in shared_srcs:
                 deferred.append(Path(sp))
+            else:
+                try:
+                    os.unlink(sp)
+                    if index is not None:
+                        index.remove_path(sp)
+                except OSError:
+                    pass
         return True
     finally:
         _dtl(-1, 0, "")
@@ -594,7 +698,7 @@ def _place_cross(new: Path, dst: Path, detail=None, label: str = "") -> None:
 
 def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
                  dry_run, log, st, detail=None, on_converted=None,
-                 deferred=None, deferred_dirs=None) -> bool:
+                 deferred=None, deferred_dirs=None, game=None) -> bool:
     import shutil as _sh
     import tempfile
     from .scratch import pick_scratch_root
@@ -678,12 +782,18 @@ def _convert_one(files, target_dir, base, fmt, subdir, n_roms, tools, index,
         # źródła (do indeksu) POBIERAMY PRZED skasowaniem źródła.
         data_sha1 = ""
         if fmt == "chd" and index is not None:
+            # ODCISK ZAWARTOŚCI = game_profile (to samo, co liczy matcher po
+            # ekstrakcji). Bez tego następny skan wypakowałby CHD niepotrzebnie.
             try:
-                row = index.lookup(min(files, key=lambda f: (
-                    _DISC_MAIN_PRIORITY.get(f.suffix.lower().lstrip("."), 9),
-                    f.name.lower())))
-                if row is not None:
-                    data_sha1 = row["sha1"] or ""
+                if game is not None:
+                    from .datfile import game_profile
+                    data_sha1 = game_profile(game.data_roms)
+                if not data_sha1:            # brak gry → fallback: suma źródła
+                    row = index.lookup(min(files, key=lambda f: (
+                        _DISC_MAIN_PRIORITY.get(f.suffix.lower().lstrip("."), 9),
+                        f.name.lower())))
+                    if row is not None:
+                        data_sha1 = row["sha1"] or ""
             except Exception:
                 data_sha1 = ""
         # 1) UMIEŚĆ gotowy plik na miejscu (RAM/scratch → D:, cross-drive).

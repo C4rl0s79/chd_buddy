@@ -348,6 +348,47 @@ def test_platform_alias_pins_child_to_parent(tmp_path: Path):
     assert effective_platform_key(fb, rules2) == "finalburn neo snes games"
 
 
+def test_chd_with_data_sha1_is_not_reprobed(tmp_path: Path, monkeypatch):
+    """CHD, który ma ustawiony data_sha1 = game_profile (tak jak robi konwersja
+    ze źródła), NIE jest ponownie wypakowywany przy skanie — matcher rozpoznaje
+    go z cache. Bez tego każdy skan mielił świeżo zrobione CHD."""
+    import chd_buddy.core.matcher as m
+    from chd_buddy.core.datstore import DatStore
+    from chd_buddy.core.datfile import game_profile
+    from chd_buddy.core.fileindex import FileIndex
+    dat_root = tmp_path / "dats"
+    root = tmp_path / "roms"
+    root.mkdir(parents=True)
+    _write_dat(dat_root / "a.dat", "Sony - PlayStation",
+               {"FIFA": {"FIFA.bin": b"DANE-FIFA" * 50}})
+    chd = root / "FIFA.chd"
+    chd.write_bytes(b"MOCK-CHD" * 64)
+    idx = FileIndex(tmp_path / "idx.sqlite3")
+    idx.scan(root)
+    entries = DatStore(dat_root, root).discover()
+    game = entries[0].load().games[0]
+    # tak robi convert_from_source po zrobieniu CHD:
+    idx.set_data_sha1(chd, game_profile(game.data_roms))
+
+    calls = {"deep": 0}
+
+    def fake_deep(*a, **k):
+        calls["deep"] += 1
+        class _R:
+            ok = False; sha1 = ""; method = ""; game = ""; tried = []
+        return _R()
+
+    class _Chd:
+        def info(self, p):
+            class _I: data_sha1 = ""; sha1 = ""
+            return _I()
+
+    monkeypatch.setattr("chd_buddy.core.deepcheck.deep_identify", fake_deep)
+    m.deep_probe_chds(idx, entries, _Chd(), roots=[root])
+    assert calls["deep"] == 0                   # NIE wypakowano — rozpoznany z cache
+    idx.close()
+
+
 def test_deep_fail_is_remembered(tmp_path: Path, monkeypatch):
     """Nieudana głęboka identyfikacja CHD jest ZAPAMIĘTYWANA — kolejny skan
     nie mieli tego samego (niezmienionego) pliku ponownie; zmiana pliku
