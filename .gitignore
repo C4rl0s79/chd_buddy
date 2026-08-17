@@ -4,6 +4,9 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+
+# --- Testy (nie należą do publikowanego repo — absolutne minimum) ---
+tests/
 .eggs/
 .pytest_cache/
 .mypy_cache/
