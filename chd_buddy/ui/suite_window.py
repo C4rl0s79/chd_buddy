@@ -58,13 +58,26 @@ _YELLOW = QColor(210, 153, 34, 60)
 _RED = QColor(248, 81, 73, 60)
 
 
-def _pulse(log: Callable[[str], None], progress=None, every: int = 200):
-    """Callback postępu skanu: pasek nieokreślony + log co `every` plików."""
+def _pulse(log: Callable[[str], None], progress=None, total: int = 0,
+           base=None, every: int = 200):
+    """Callback postępu skanu (`on_file`): steruje paskiem OGÓLNYM licząc pliki.
+
+    total>0 → pasek określony „plik X z Y" (mianownik z szybkiego pre-countu);
+    total=0 → nieokreślony „skan… X plików". base=[int] akumuluje licznik
+    między kolejnymi katalogami. Raportuje OD PIERWSZEGO pliku (n==1), a nie
+    dopiero po 20 — inaczej przy wielkich plikach (CHD/ISO) pasek długo stoi."""
     def cb(n: int, path: Path) -> None:
-        if progress is not None and n % 20 == 0:
-            progress(0, 0, f"skan… {n} plików ({path.name})")
+        g = (base[0] if base else 0) + n
+        if progress is not None and (n == 1 or n % 5 == 0):
+            if total:
+                progress(g, total, tr("plik {i} z {n}: {name}").format(
+                    i=g, n=total, name=path.name))
+            else:
+                progress(0, 0, tr("skan… {n} plików ({name})").format(
+                    n=g, name=path.name))
         if n % every == 0:
-            log(f"  … {n} plików ({path.name})")
+            tail = f"/{total}" if total else ""
+            log(f"  … {g}{tail} plików ({path.name})")
     return cb
 
 
@@ -184,7 +197,8 @@ class SuiteWindow(QMainWindow):
         self.pool = QThreadPool.globalInstance()
         self._busy = False
         self._workers: list[FnWorker] = []   # referencje na czas życia zadań
-        self.setWindowTitle(tr("ROM Kombajn — chd_buddy"))
+        from .. import __version__ as _ver
+        self.setWindowTitle(tr("ROM Kombajn — chd_buddy") + f"  v{_ver}")
         self.resize(1080, 720)
 
         central = QWidget()
@@ -503,8 +517,15 @@ class SuiteWindow(QMainWindow):
                           "none = bez kompresji."))
         sp_zip = QSpinBox(); sp_zip.setRange(0, 9)
         sp_zip.setValue(int(self.settings.zip_level))
-        sp_zip.setToolTip(tr("ZIP: poziom DEFLATE. 0 = bez kompresji (szybko), "
+        sp_zip.setToolTip(tr("ZIP: poziom kompresji. 0 = bez kompresji (szybko), "
                              "6 = domyślny, 9 = najmniejszy plik (wolniej)."))
+        cmb_zipm = QComboBox()
+        cmb_zipm.addItems(["deflate", "zstd"])
+        cmb_zipm.setCurrentText(getattr(self.settings, "zip_method", "deflate"))
+        cmb_zipm.setToolTip(tr(
+            "Metoda ZIP: deflate = działa w KAŻDYM emulatorze/scraperze "
+            "(zalecane). zstd = mniejszy plik, ale wiele narzędzi go NIE czyta "
+            "(błąd „Failed to inflate”)."))
         sp_rvz = QSpinBox(); sp_rvz.setRange(1, 22)
         sp_rvz.setValue(int(self.settings.rvz_level))
         sp_rvz.setToolTip(tr("RVZ (GameCube/Wii): poziom zstd 1–22. 5 = domyślny; "
@@ -514,6 +535,7 @@ class SuiteWindow(QMainWindow):
         sp_blk.setToolTip(tr("RVZ: rozmiar bloku (128 KB = domyślny)."))
         form.addRow(tr("Preset kompresji CHD:"), cmb)
         form.addRow(tr("Poziom ZIP (0–9):"), sp_zip)
+        form.addRow(tr("Metoda ZIP:"), cmb_zipm)
         form.addRow(tr("Poziom RVZ (zstd 1–22):"), sp_rvz)
         form.addRow(tr("Blok RVZ:"), sp_blk)
         note = QLabel(tr("Poziomy działają przy naprawie/konwersji do formatu "
@@ -529,14 +551,21 @@ class SuiteWindow(QMainWindow):
         if dlg.exec():
             self.settings.compression_preset = cmb.currentText()
             self.settings.zip_level = int(sp_zip.value())
+            self.settings.zip_method = cmb_zipm.currentText()
             self.settings.rvz_level = int(sp_rvz.value())
             self.settings.rvz_block_kb = int(sp_blk.value())
             self.settings.save()
             self._log(tr("Kompresja zapisana:") +
                       f" CHD={self.settings.compression_preset}, "
-                      f"ZIP={self.settings.zip_level}, "
+                      f"ZIP={self.settings.zip_level}/"
+                      f"{self.settings.zip_method}, "
                       f"RVZ=zstd{self.settings.rvz_level}/"
                       f"{self.settings.rvz_block_kb}KB.")
+            if self.settings.zip_method == "zstd":
+                QMessageBox.warning(self, tr("Kompresja ZIP"), tr(
+                    "Wybrano ZSTD dla ZIP. Mniejsze pliki, ale wiele emulatorów "
+                    "i scraperów NIE odczyta takich archiwów (błąd „Failed to "
+                    "inflate”). Użyj tylko, gdy Twoje narzędzia wspierają ZSTD."))
 
     def _edit_language(self) -> None:
         """Wybór języka interfejsu (zmiana po restarcie)."""
@@ -786,6 +815,16 @@ class SuiteWindow(QMainWindow):
         self.game_filter.currentIndexChanged.connect(
             lambda _i: self._on_dat_selected(self.tree.currentItem(), None))
         sort_row.addWidget(self.game_filter)
+        # filtr JĘZYKA tłumaczeń (uzupełniany po skanie z indeksu wariantów)
+        sort_row.addWidget(QLabel(tr("Język:")))
+        self.lang_filter = QComboBox()
+        self.lang_filter.addItem(tr("wszystkie języki"), "")
+        self.lang_filter.setToolTip(tr(
+            "Pokazuje gry mające dostępne tłumaczenie w tym języku "
+            "(lub już podmienione na ten język)."))
+        self.lang_filter.currentIndexChanged.connect(
+            lambda _i: self._on_dat_selected(self.tree.currentItem(), None))
+        sort_row.addWidget(self.lang_filter)
         sort_row.addStretch()
         mid_lay.addLayout(sort_row)
         self.game_list = QTreeWidget()
@@ -910,6 +949,7 @@ class SuiteWindow(QMainWindow):
         from ..core.matcher import RomState
         rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
                 RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                RomState.CREATABLE: 2,
                 RomState.HAVE: 1, RomState.HAVE_CHD: 1}
         maps: dict = {}
         worst: dict = {}
@@ -955,10 +995,17 @@ class SuiteWindow(QMainWindow):
         statuses = self._rom_statuses_for(entry)   # pełne RomStatus (akcje)
         rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
                 RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                RomState.CREATABLE: 2,
                 RomState.HAVE: 1, RomState.HAVE_CHD: 1}
         worst = {g: max(roms.values(), key=lambda st: rank[st])
                  for g, roms in maps.items()}
         want = self.game_filter.currentData()
+        # kontekst TŁUMACZEŃ: podmienione sloty i dostępne warianty
+        from ..core.translations import base_title as _bt
+        _store = getattr(self, "_trans_store", None)
+        _vindex = getattr(self, "_variant_index", {}) or {}
+        _want_lang = (self.lang_filter.currentData()
+                      if hasattr(self, "lang_filter") else "") or ""
         self.game_list.setUpdatesEnabled(False)
         LIMIT = 50000
         shown = 0
@@ -973,7 +1020,8 @@ class SuiteWindow(QMainWindow):
                            for s in roms.values())
             if stt in (RomState.HAVE, RomState.HAVE_CHD):
                 col, note, kind = _GREEN, "komplet", "complete"
-            elif stt in (RomState.WRONG_NAME, RomState.ELSEWHERE):
+            elif stt in (RomState.WRONG_NAME, RomState.ELSEWHERE,
+                         RomState.CREATABLE):
                 col, note, kind = _YELLOW, "do naprawy", "fix"
             elif stt in (RomState.MISSING, RomState.NO_HASH):
                 if have_any:      # część plików jest, część brakuje
@@ -984,8 +1032,23 @@ class SuiteWindow(QMainWindow):
                 col, note, kind = None, "", "unknown"
             if want != "all" and kind != want:
                 continue
+            # TŁUMACZENIA: podmieniony slot / dostępne warianty + filtr języka
+            _sub = _store.get(entry.name, game.name) if _store else None
+            _avail = _vindex.get(_bt(game.name), [])
+            _langs_avail = {lg for v in _avail for lg in v.langs}
+            if _want_lang:
+                _sub_lang = (_want_lang in (_sub.get("lang", "") if _sub else ""))
+                if not (_sub_lang or _want_lang in _langs_avail):
+                    continue
+            disp = game.name
+            if _sub:
+                disp = f"🌐 {game.name}"
+                note = (note + " · " if note else "") + tr("tłumaczenie") \
+                    + (f" [{_sub.get('lang')}]" if _sub.get("lang") else "")
+            elif _avail:
+                disp = f"{game.name}  🌐"
             shown += 1
-            it = QTreeWidgetItem([game.name, str(len(game.roms)), note])
+            it = QTreeWidgetItem([disp, str(len(game.roms)), note])
             it.setData(0, Qt.ItemDataRole.UserRole, game)
             it.setData(0, Qt.ItemDataRole.UserRole + 1, maps.get(game.name))
             it.setData(0, Qt.ItemDataRole.UserRole + 2,
@@ -1004,6 +1067,8 @@ class SuiteWindow(QMainWindow):
         from ..core.matcher import RomState
         if s is None or s.state in (RomState.HAVE, RomState.HAVE_CHD):
             return ""
+        if s.state == RomState.CREATABLE:
+            return "utwórz pusty plik-znacznik (0 bajtów)"
         if s.state in (RomState.MISSING, RomState.NO_HASH):
             return "brak źródła — nie da się naprawić"
         src = Path(s.source_path)
@@ -1042,6 +1107,8 @@ class SuiteWindow(QMainWindow):
                 st = state_map.get(rom.name.lower())
                 if st in (RomState.HAVE, RomState.HAVE_CHD):
                     col, txt = _GREEN, "jest"
+                elif st == RomState.CREATABLE:
+                    col, txt = _YELLOW, "do utworzenia"
                 elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE):
                     col, txt = _YELLOW, "do naprawy"
                 else:
@@ -1070,7 +1137,309 @@ class SuiteWindow(QMainWindow):
         menu = QMenu(self)
         act = menu.addAction(tr("🖼 Stwórz ikonę:") + f" {game.name}…")
         act.triggered.connect(lambda: self._icon_for_game(entry, game.name))
+        act_up = menu.addAction(tr("⬆ Aktualizuj z nowszej wersji…"))
+        act_up.triggered.connect(lambda: self._update_game_from_newer(entry, game))
+        # --- TŁUMACZENIA ---
+        menu.addSeparator()
+        store = getattr(self, "_trans_store", None)
+        vindex = getattr(self, "_variant_index", {}) or {}
+        from ..core.translations import base_title as _bt
+        has_variants = bool(vindex.get(_bt(game.name)))
+        act_sub = menu.addAction(tr("🌐 Podmień na tłumaczenie…"))
+        act_sub.setEnabled(has_variants)
+        act_sub.triggered.connect(
+            lambda: self._substitute_translation(entry, game))
+        act_man = menu.addAction(tr("🌐 Podmień plik ręcznie…"))
+        act_man.triggered.connect(
+            lambda: self._substitute_manual(entry, game))
+        if store and store.has(entry.name, game.name):
+            act_rst = menu.addAction(tr("↩ Cofnij podmianę tłumaczenia"))
+            act_rst.triggered.connect(
+                lambda: self._restore_translation(entry, game))
         menu.exec(self.game_list.viewport().mapToGlobal(pos))
+
+    # --- TŁUMACZENIA: filtr języka + podmiany ------------------------------
+
+    def _refresh_lang_filter(self) -> None:
+        """Uzupełnia combo języków z indeksu wariantów (zachowuje wybór)."""
+        if not hasattr(self, "lang_filter"):
+            return
+        from ..core.translations import all_languages
+        cur = self.lang_filter.currentData()
+        self.lang_filter.blockSignals(True)
+        self.lang_filter.clear()
+        self.lang_filter.addItem(tr("wszystkie języki"), "")
+        for lg in all_languages(getattr(self, "_variant_index", {}) or {}):
+            self.lang_filter.addItem(lg, lg)
+        i = self.lang_filter.findData(cur)
+        self.lang_filter.setCurrentIndex(i if i >= 0 else 0)
+        self.lang_filter.blockSignals(False)
+
+    def _game_canonical(self, entry, game):
+        """Ścieżka kanoniczna slotu gry JEDNOPLIKOWEJ (v1). None gdy wieloplik."""
+        data = [r for r in game.roms
+                if not r.name.lower().endswith((".cue", ".gdi"))]
+        if len(data) != 1:
+            return None
+        return entry.target_dir / data[0].name
+
+    def _preserve_dir(self, entry):
+        from ..core.translations import preserve_dir_for
+        tosort = self.row_tosort.path or (self.row_roms.path + "/to sort")
+        return preserve_dir_for(tosort, entry.name)
+
+    def _substitute_translation(self, entry, game) -> None:
+        from PySide6.QtWidgets import QInputDialog, QMessageBox
+        from ..core.translations import (variants_for, apply_substitution)
+        store = getattr(self, "_trans_store", None)
+        vindex = getattr(self, "_variant_index", {}) or {}
+        if store is None:
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("Najpierw wykonaj skan kolekcji."))
+            return
+        lang = (self.lang_filter.currentData() or "") \
+            if hasattr(self, "lang_filter") else ""
+        variants = variants_for(vindex, game.name, lang=lang)
+        if not variants:
+            QMessageBox.information(self, tr("Tłumaczenia"),
+                                    tr("Brak dostępnych tłumaczeń dla tej gry."))
+            return
+        labels = [f"[{v.lang_str}] {v.game}  ({v.dat_name})" for v in variants]
+        choice, ok = QInputDialog.getItem(
+            self, tr("Podmień na tłumaczenie"),
+            tr("Wybierz wariant dla „{}”:").format(game.name),
+            labels, 0, False)
+        if not ok:
+            return
+        variant = variants[labels.index(choice)]
+        canonical = self._game_canonical(entry, game)
+        if canonical is None:
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("V1 obsługuje gry jednoplikowe."))
+            return
+        preserve = self._preserve_dir(entry)
+        if QMessageBox.question(
+                self, tr("Podmień na tłumaczenie"),
+                tr("Gra: {}\nWariant: {}\n\nOryginał → {}\nSlot (nazwa "
+                   "kanoniczna) → symlink do tłumaczenia.\n\nKontynuować?")
+                .format(game.name, variant.game, preserve)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        ok2 = apply_substitution(canonical, Path(variant.canonical), preserve,
+                                 index=None, make_links=True, dry_run=False,
+                                 log=self._log)
+        if not ok2:
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("Podmiana nie powiodła się (patrz log)."))
+            return
+        store.set(entry.name, game.name, variant)
+        store.save()
+        self._log(f"TŁUMACZENIE zapisane: {game.name} -> {variant.game}")
+        self._on_dat_selected(self.tree.currentItem(), None)
+
+    def _substitute_manual(self, entry, game) -> None:
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from ..core.translations import apply_substitution, parse_langs
+        from ..core.fileindex import hash_file
+        store = getattr(self, "_trans_store", None)
+        if store is None:
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("Najpierw wykonaj skan kolekcji."))
+            return
+        canonical = self._game_canonical(entry, game)
+        if canonical is None:
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("V1 obsługuje gry jednoplikowe."))
+            return
+        start = self.row_roms.path or ""
+        repl, _ = QFileDialog.getOpenFileName(
+            self, tr("Plik zastępujący (tłumaczenie) dla: ") + game.name, start)
+        if not repl:
+            return
+        replp = Path(repl)
+        preserve = self._preserve_dir(entry)
+        if QMessageBox.question(
+                self, tr("Podmień plik ręcznie"),
+                tr("Slot: {}\nZamiennik: {}\n\nOryginał → {}\n\nKontynuować?")
+                .format(canonical.name, replp.name, preserve)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        if not apply_substitution(canonical, replp, preserve, index=None,
+                                  make_links=True, dry_run=False,
+                                  log=self._log):
+            QMessageBox.warning(self, tr("Tłumaczenia"),
+                                tr("Podmiana nie powiodła się (patrz log)."))
+            return
+        try:
+            _c, _m, sha1 = hash_file(replp)
+        except OSError:
+            sha1 = ""
+        langs = parse_langs(replp.name)
+        store.set_manual(entry.name, game.name, sha1=sha1, name=replp.name,
+                         src=str(replp), lang=",".join(langs))
+        store.save()
+        self._log(f"TŁUMACZENIE (ręczne) zapisane: {game.name} -> {replp.name}")
+        self._on_dat_selected(self.tree.currentItem(), None)
+
+    def _restore_translation(self, entry, game) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from ..core.translations import restore_original
+        store = getattr(self, "_trans_store", None)
+        if store is None:
+            return
+        canonical = self._game_canonical(entry, game)
+        if canonical is None:
+            return
+        preserve = self._preserve_dir(entry)
+        if QMessageBox.question(
+                self, tr("Cofnij podmianę"),
+                tr("Przywrócić oryginał gry „{}” z {}?")
+                .format(game.name, preserve)) \
+                != QMessageBox.StandardButton.Yes:
+            return
+        restore_original(canonical, preserve, index=None, dry_run=False,
+                         log=self._log)
+        store.remove(entry.name, game.name)
+        store.save()
+        self._log(f"ODTWORZONO oryginał: {game.name}")
+        self._on_dat_selected(self.tree.currentItem(), None)
+
+    def _update_game_from_newer(self, entry, game) -> None:
+        """Aktualizuje grę do NOWSZEJ wersji: wskaż plik(i), podgląd+korekta,
+        stara wersja → ToSort, nowa → docelowy, wpis w DAT zaktualizowany."""
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from ..core.dirrules import DirRules
+        from ..core.update_game import UpdatePlan, apply_update, roms_from_files
+        start = self.row_tosort.path or self.row_roms.path or ""
+        # nowsza wersja to POJEDYNCZE pliki czy CAŁY katalog (np. pack MSU-1)?
+        box = QMessageBox(self)
+        box.setWindowTitle(tr("Aktualizuj z nowszej wersji"))
+        box.setText(tr("Nowsza wersja „{}” to:").format(game.name))
+        b_files = box.addButton(tr("Pliki…"), QMessageBox.ButtonRole.AcceptRole)
+        b_dir = box.addButton(tr("Katalog…"), QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is b_dir:
+            d = QFileDialog.getExistingDirectory(
+                self, tr("Katalog z NOWSZĄ wersją: ") + game.name, start)
+            if not d:
+                return
+            new_files = sorted((p for p in Path(d).rglob("*") if p.is_file()),
+                               key=lambda p: p.name.lower())
+            if not new_files:
+                QMessageBox.warning(self, tr("Aktualizacja gry"),
+                                    tr("Katalog jest pusty (brak plików)."))
+                return
+        elif clicked is b_files:
+            files, _ = QFileDialog.getOpenFileNames(
+                self, tr("Wskaż plik(i) NOWSZEJ wersji: ") + game.name, start)
+            if not files:
+                return
+            new_files = [Path(f) for f in files]
+        else:
+            return
+        dat_root = Path(self.row_dats.path)
+        rules = DirRules(dat_root) if dat_root.is_dir() else None
+        eff = rules.for_entry(entry) if rules else {}
+        fmt = eff.get("format", getattr(entry, "store_format", "keep"))
+        subdir = bool(eff.get("subdir_per_game", True))
+        # STARE pliki tej gry w docelowym (z ostatniego raportu — HAVE/WRONG)
+        old_files: list = []
+        st_map = (self._rom_statuses_for(entry) or {}).get(game.name, {})
+        tprefix = os.path.normcase(str(entry.target_dir)).rstrip("\\/") + os.sep
+        for s in st_map.values():
+            sp = getattr(s, "source_path", "") or ""
+            if sp and os.path.normcase(sp).startswith(tprefix) and Path(sp).is_file():
+                old_files.append(Path(sp))
+        old_files = list({os.path.normcase(str(p)): p for p in old_files}.values())
+        same_format = (fmt in ("keep", "", "extract")
+                       or all(f.suffix.lower().lstrip(".") == fmt
+                              for f in new_files))
+
+        def job(log, progress):
+            roms = roms_from_files(
+                new_files, on_progress=lambda i, n, nm:
+                    progress(i, n, f"licz sumy: {nm}"))
+            return roms
+
+        def done(roms):
+            plan = UpdatePlan(
+                game_name=game.name, dat_path=Path(entry.dat_path),
+                target_dir=entry.target_dir, store_format=fmt, subdir=subdir,
+                old_files=old_files, new_files=new_files, new_roms=roms,
+                same_format=same_format)
+            if not self._confirm_update(plan):
+                return
+            db = self.settings.index_db_path or None
+            tosort = self.row_tosort.path
+
+            def apply_job(log, progress):
+                from ..core.fileindex import FileIndex
+                with FileIndex(Path(db) if db else None) as idx:
+                    ok = apply_update(
+                        plan, index=idx, tosort=Path(tosort) if tosort else None,
+                        dry_run=False, log=log)
+                return ok
+
+            self._run(apply_job, lambda ok: self._after_update(plan, ok),
+                      title=tr("Aktualizacja gry"))
+
+        self._run(job, done, title=tr("Liczę sumy nowej wersji"))
+
+    def _confirm_update(self, plan) -> bool:
+        """Podgląd aktualizacji z możliwością KOREKTY nazwy gry (gdy źle
+        wykryta). Zwraca True gdy user zatwierdzi."""
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel,
+                                       QLineEdit, QPlainTextEdit, QVBoxLayout)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(tr("Aktualizuj grę z nowszej wersji"))
+        dlg.resize(680, 460)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(tr("Gra w DAT do zaktualizowania (popraw, jeśli "
+                                "źle wykryta):")))
+        edit = QLineEdit(plan.game_name)
+        lay.addWidget(edit)
+        info = QPlainTextEdit(); info.setReadOnly(True)
+        lines = [tr("DAT: ") + Path(plan.dat_path).name,
+                 tr("Katalog docelowy: ") + str(plan.target_dir),
+                 tr("Format: ") + str(plan.store_format)
+                 + ("" if plan.same_format else tr("  (inny format — nowe pliki "
+                    "zostaną w źródle; uruchom Napraw, by skonwertować)")),
+                 "", tr("STARA wersja → ToSort:")]
+        lines += [f"   {p}" for p in plan.old_files] or ["   (brak/na miejscu)"]
+        lines += ["", tr("NOWA wersja ({} plik.):").format(len(plan.new_roms))]
+        for r in plan.new_roms:
+            lines.append(f"   {r.name}  ({r.size} B, crc {r.crc}, "
+                         f"sha1 {r.sha1[:12]}…)")
+        lines += ["", tr("→ wpis w DAT zostanie NADPISANY tymi ROM-ami "
+                         "(kopia .bak).")]
+        info.setPlainText("\n".join(lines))
+        lay.addWidget(info, 1)
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return False
+        plan.game_name = edit.text().strip() or plan.game_name
+        return True
+
+    def _after_update(self, plan, ok) -> None:
+        if ok:
+            self._log(f"[AKTUALIZACJA] '{plan.game_name}': zaktualizowano DAT "
+                      f"i podmieniono plik(i). Zrób Skanuj, by odświeżyć.")
+            extra = ("." if plan.same_format else tr(
+                " — a potem „Napraw”, by skonwertować nowe pliki do formatu "
+                "docelowego."))
+            QMessageBox.information(
+                self, tr("Aktualizacja gry"),
+                tr("Zaktualizowano grę i DAT. Uruchom „Skanuj i raportuj”, "
+                   "by odświeżyć stan") + extra)
+        else:
+            QMessageBox.warning(self, tr("Aktualizacja gry"),
+                                tr("Aktualizacja nie powiodła się (szczegóły "
+                                   "w logu)."))
 
     def _current_entry(self):
         from ..core.datstore import DatEntry
@@ -1352,12 +1721,16 @@ class SuiteWindow(QMainWindow):
         db = self.settings.index_db_path or None
         settings = self.settings
 
-        def job(log: Callable[[str], None], progress, cancel):
-            from ..core.fileindex import FileIndex
+        def job(log: Callable[[str], None], progress, cancel, detail):
+            from ..core.fileindex import FileIndex, count_files
             with FileIndex(Path(db) if db else None) as idx:
                 prober = _chd_prober(settings, log)
+                progress(0, 0, tr("liczenie plików…"))
+                grand = count_files(Path(d), cancel=cancel)
+                log(f"Do przeliczenia: {grand} plików")
                 st = idx.scan(Path(d), full=True, chd_prober=prober,
-                              on_file=_pulse(log, progress), cancel=cancel)
+                              on_file=_pulse(log, progress, total=grand),
+                              detail=detail, cancel=cancel)
                 log(f"PEŁNY skan {d}: {st.summary()}")
                 return st.summary()
 
@@ -1502,7 +1875,7 @@ class SuiteWindow(QMainWindow):
         def job(log: Callable[[str], None], progress, cancel, detail):
             from ..core.datstore import DatStore
             from ..core.fileindex import FileIndex
-            from ..core.matcher import match_entry
+            from ..core.matcher import DatReport, match_game
             with FileIndex(Path(db) if db else None) as idx:
                 prober = (_chd_prober(settings, log)
                           if chd_mode in ("header", "deep") else None)
@@ -1531,13 +1904,26 @@ class SuiteWindow(QMainWindow):
                     if ts and Path(ts).is_dir() and ts not in seen:
                         seen.add(ts)
                         roots.append(ts)
+                # szybki PRE-COUNT (sam scandir) → mianownik „plik X z Y";
+                # bez tego pasek stoi bez liczby, a przy wielkich plikach długo.
+                from ..core.fileindex import count_files
+                progress(0, 0, tr("liczenie plików…"))
+                grand = 0
+                for r in roots:
+                    if cancel.is_set():
+                        break
+                    grand += count_files(Path(r), cancel=cancel)
+                log(f"Do przeskanowania: {grand} plików w {len(roots)} katalogach")
+                base = [0]
                 for ri, r in enumerate(roots):
                     if cancel.is_set():
                         break
-                    progress(ri, len(roots), f"skan: {r}")
                     log(f"Skan: {r}")
                     st = idx.scan(Path(r), full=full, chd_prober=prober,
-                                  on_file=_pulse(log, progress), cancel=cancel)
+                                  on_file=_pulse(log, progress, total=grand,
+                                                 base=base),
+                                  detail=detail, cancel=cancel)
+                    base[0] += st.seen
                     log(f"  {st.summary()}")
                 log(f"DAT-ów: {len(enabled)} włączonych z {len(all_entries)}")
                 # DUCHY: wpisy pod korzeniami, które ZNIKNĘŁY (np. skasowane
@@ -1548,6 +1934,19 @@ class SuiteWindow(QMainWindow):
                     _deep_probe_gui(idx, enabled, settings, chd_mode, roots,
                                     log, cancel=cancel, on_progress=progress,
                                     detail=detail)
+                # DOPASOWANIE Z CACHE W PAMIĘCI: wczytujemy indeks raz do RAM
+                # (słowniki po sumach) — inaczej matching całej kolekcji to
+                # dziesiątki tysięcy SELECT-ów (minuty). Z cache: sekundy.
+                progress(0, 0, tr("wczytywanie indeksu do pamięci…"))
+                idx.build_match_cache()
+                # PODMIANY na tłumaczenia (translations.json) = źródło prawdy:
+                # gry z zapisanym wyborem są SPEŁNIONE tłumaczeniem (nie „brak").
+                try:
+                    from ..core.translations import TranslationStore
+                    _tsub = TranslationStore(
+                        Path(settings.rom_root) / TranslationStore.FILENAME).subs
+                except Exception:
+                    _tsub = {}
                 reports = []
                 for i, e in enumerate(enabled):
                     if cancel.is_set():
@@ -1555,7 +1954,24 @@ class SuiteWindow(QMainWindow):
                             f"DAT-ów — wyniki cząstkowe zachowane.")
                         break
                     progress(i, len(enabled), f"dopasowanie: {e.name}")
-                    reports.append(match_entry(e, idx))
+                    # dopasowanie per gra z PODPOSTĘPEM (pasek szczegółowy) —
+                    # wielkie DAT-y (PS2/PSX/MSU-1) grinduje tysiące gier, bez
+                    # tego pasek „stał" na jednym % i wyglądał na zawieszony.
+                    e.load()
+                    games = e.games
+                    ng = len(games) or 1
+                    if ng > 300:
+                        log(f"  dopasowanie: {e.name} — {ng} gier…")
+                    rep = DatReport(e)
+                    for gi, g in enumerate(games):
+                        if cancel.is_set():
+                            break
+                        if gi % 300 == 0:
+                            detail(gi, ng, f"{e.name}: gra {gi}/{ng}")
+                        rep.statuses.extend(match_game(e, g, idx, _tsub))
+                    detail(ng, ng, f"{e.name}: {ng}/{ng}")
+                    reports.append(rep)
+                idx.drop_match_cache()
                 progress(len(reports), len(enabled), "dopasowanie")
                 return all_entries, reports
 
@@ -1570,6 +1986,22 @@ class SuiteWindow(QMainWindow):
         # PRZEPIS dla naprawy: pełne raporty zostają w pamięci, więc „Napraw"
         # NIE skanuje niczego ponownie — parsuje tylko to, co tu policzone.
         self._reports = reports
+        # TŁUMACZENIA: trwały wybór podmian + indeks dostępnych wariantów
+        # (z DAT-ów o roli „translations") do dropdownu i filtra języka.
+        try:
+            from ..core.translations import (TranslationStore,
+                                             build_variant_index)
+            from ..core.dirrules import DirRules
+            self._trans_store = TranslationStore(
+                Path(self.settings.rom_root) / TranslationStore.FILENAME)
+            _dr = DirRules(Path(self.row_dats.path))
+            self._variant_index = build_variant_index(
+                reports, lambda e: _dr.for_entry(e))
+            self._refresh_lang_filter()
+        except Exception as e:                    # tłumaczenia nie mogą ubić skanu
+            self._trans_store = None
+            self._variant_index = {}
+            self._log(f"UWAGA: tłumaczenia niedostępne: {e}")
         self._plan = None            # plan (dry-run) unieważniony nowym skanem
         self._saved_states = {}      # świeży raport zastępuje cache w widoku
         self._fill_dats(all_entries, with_stats=True)
@@ -1799,7 +2231,9 @@ class SuiteWindow(QMainWindow):
                             if del_tosort else [])
                 rb = Rebuilder(idx, tosort=Path(tosort) if tosort else None,
                                dry_run=dry, log=log, make_links=make_links,
-                               detail=detail, zip_level=settings.zip_level)
+                               detail=detail, zip_level=settings.zip_level,
+                               zip_method=getattr(settings, "zip_method",
+                                                  "deflate"))
 
                 def _make_tools():
                     from ..core.convert import detect_dolphintool
@@ -1826,7 +2260,7 @@ class SuiteWindow(QMainWindow):
                         reports, rules.for_entry, _make_tools(), index=idx,
                         dry_run=dry, log=log, cancel=cancel, detail=detail,
                         on_progress=progress, on_converted=rb.add_canonical,
-                        delete_roots=del_from)
+                        delete_roots=del_from, make_links=make_links)
                     log(f"Konwersja ze źródła: {cst0.summary()} "
                         f"({len(converted_games)} gier na RAM, docelowy dostał "
                         f"tylko finał).")
@@ -1979,8 +2413,8 @@ class SuiteWindow(QMainWindow):
         db = self.settings.index_db_path or None
         chdman_path = self.settings.chdman_path or None
 
-        def job(log: Callable[[str], None], progress):
-            from ..core.fileindex import FileIndex
+        def job(log: Callable[[str], None], progress, cancel, detail):
+            from ..core.fileindex import FileIndex, count_files
             prober = None
             if with_chd:
                 from ..core.chdman import CHDMan
@@ -1990,11 +2424,19 @@ class SuiteWindow(QMainWindow):
                     i = chd.info(p)
                     return i.data_sha1 or i.sha1 or ""
             with FileIndex(Path(db) if db else None) as idx:
+                progress(0, 0, tr("liczenie plików…"))
+                grand = sum(count_files(Path(r), cancel=cancel) for r in roots)
+                log(f"Do przeskanowania: {grand} plików")
+                base = [0]
                 for i, r in enumerate(roots):
-                    progress(i, len(roots), f"skan: {r}")
+                    if cancel.is_set():
+                        break
                     log(f"Skanuję: {r}")
                     st = idx.scan(Path(r), full=full, chd_prober=prober,
-                                  log=log, on_file=_pulse(log, progress))
+                                  log=log, detail=detail,
+                                  on_file=_pulse(log, progress, total=grand,
+                                                 base=base), cancel=cancel)
+                    base[0] += st.seen
                     log(f"  {st.summary()}")
                 return idx.stats()
 

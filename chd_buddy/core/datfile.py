@@ -29,12 +29,16 @@ class DatRom:
     crc: str = ""
     md5: str = ""
     sha1: str = ""
+    merge: str = ""      # MAME: ten ROM jest WSPÓŁDZIELONY z rodzicem pod nazwą
+                         # `merge` (w secie split/merged bierze się go z parenta)
 
 
 @dataclass
 class DatGame:
     name: str
     roms: List[DatRom] = field(default_factory=list)
+    cloneof: str = ""    # MAME: nazwa gry-RODZICA (klon), np. darkseal1→darkseal
+    romof: str = ""      # MAME: skąd dziedziczy ROM-y (zwykle == cloneof)
 
     @property
     def media(self) -> MediaType:
@@ -188,7 +192,11 @@ def parse_dat(path: Path):
                 crc=(r.get("crc") or "").strip(),
                 md5=(r.get("md5") or "").strip(),
                 sha1=(r.get("sha1") or "").strip(),
+                merge=(r.get("merge") or "").strip(),
             ))
         if roms:
-            yield DatGame(name=name, roms=roms)
+            # MAME: relacje rodzic/klon (świadomość merged/split/non-merged)
+            yield DatGame(name=name, roms=roms,
+                          cloneof=(elem.get("cloneof") or "").strip(),
+                          romof=(elem.get("romof") or "").strip())
         elem.clear()  # zwolnij pamięć

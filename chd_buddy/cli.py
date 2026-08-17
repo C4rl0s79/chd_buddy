@@ -356,7 +356,11 @@ def cmd_report(args, settings: Settings) -> int:
     with _open_index(args, settings) as idx:
         _scan_sources(idx, args, settings)
         _maybe_deep_probe(idx, entries, args, settings)
-        reports = match_store(entries, idx)
+        idx.build_match_cache()          # dopasowanie w RAM (sekundy, nie minuty)
+        try:
+            reports = match_store(entries, idx)
+        finally:
+            idx.drop_match_cache()
     grand_total = grand_have = 0
     for rep in reports:
         have = rep.count(RomState.HAVE, RomState.HAVE_CHD)
@@ -389,7 +393,11 @@ def cmd_rebuild(args, settings: Settings) -> int:
     with _open_index(args, settings) as idx:
         _scan_sources(idx, args, settings)
         _maybe_deep_probe(idx, entries, args, settings)
-        reports = match_store(entries, idx)
+        idx.build_match_cache()          # dopasowanie w RAM (sekundy, nie minuty)
+        try:
+            reports = match_store(entries, idx)
+        finally:
+            idx.drop_match_cache()
         dedup_roots = ([] if args.keep_copies else
                        [r for r in (args.roms, args.tosort) if r])
         rb = Rebuilder(idx, tosort=Path(args.tosort) if args.tosort else None,

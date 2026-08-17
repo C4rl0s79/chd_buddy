@@ -1,8 +1,10 @@
-"""Punkt wejścia GUI ROM Kombajnu (okno z zakładkami).
+"""Alias punktu wejścia GUI ROM Kombajnu.
 
-Uruchomienie:  py -m chd_buddy.suite   (albo chd-buddy-suite po instalacji)
-Klasyczne narzędzie CHD pozostaje dostępne przez chd-buddy-gui oraz z menu
-Narzędzia wewnątrz kombajnu.
+`py -m chd_buddy.suite` i `py -m chd_buddy.main` uruchamiają TO SAMO okno
+(SuiteWindow / ROM Kombajn). Cała logika startu (crash-handler, auto-UAC dla
+symlinków, język, high-DPI) jest w `chd_buddy.main` — tu tylko delegujemy,
+żeby nie utrzymywać dwóch launcherów. Klasyczne narzędzie CHD jest wbudowane
+w kombajn (menu Narzędzia), nie jest osobną aplikacją.
 """
 from __future__ import annotations
 
@@ -14,27 +16,14 @@ if __package__ in (None, ""):
     _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     if _root not in sys.path:
         sys.path.insert(0, _root)
-    from chd_buddy.suite import main
+    from chd_buddy.main import main
 
     raise SystemExit(main())
 
 
 def main() -> int:
-    from .main import _install_crash_handlers
-
-    _install_crash_handlers()
-
-    from PySide6.QtWidgets import QApplication
-
-    from .core.settings import Settings
-    from .ui.suite_window import SuiteWindow
-
-    app = QApplication(sys.argv)
-    app.setApplicationName("ROM Kombajn")
-    settings = Settings.load()
-    win = SuiteWindow(settings)
-    win.show()
-    return app.exec()
+    from .main import main as _main       # jedno źródło prawdy
+    return _main()
 
 
 if __name__ == "__main__":

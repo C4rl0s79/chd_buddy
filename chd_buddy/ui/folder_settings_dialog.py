@@ -62,6 +62,17 @@ class FolderSettingsDialog(QDialog):
         self.chk_parent.setChecked(bool(cur.get("parent_priority", False)))
         form.addRow(tr("Rola:"), self.chk_parent)
 
+        # ROLA wszystkich DAT-ów w katalogu: kolekcja albo pula tłumaczeń
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItem(tr("kolekcja (parent/child)"), "collection")
+        self.cmb_role.addItem(tr("tłumaczenia (pula wariantów do podmiany)"),
+                              "translations")
+        self._select(self.cmb_role, cur.get("role", "collection"))
+        self.cmb_role.setToolTip(tr(
+            "„tłumaczenia” = wszystkie DAT-y w tym katalogu to źródło fanowskich "
+            "tłumaczeń (pula wariantów do podmiany w innych DAT-ach)."))
+        form.addRow(tr("Rola DAT-u:"), self.cmb_role)
+
         self.cmb_format = QComboBox()
         for k, l in _FORMATS:
             self.cmb_format.addItem(tr(l), k)
@@ -133,6 +144,7 @@ class FolderSettingsDialog(QDialog):
             "subdir_per_game": self.chk_subdir.isChecked(),
             "only_complete": self.chk_complete.isChecked(),
             "prefer_translations": self.chk_trans.isChecked(),
+            "role": self.cmb_role.currentData(),
         }
         try:
             save_rule(self.dat_root, self.folder_key, updates)

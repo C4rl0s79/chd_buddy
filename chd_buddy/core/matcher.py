@@ -36,6 +36,9 @@ class RomState(Enum):
     HAVE_CHD = "have_chd"
     WRONG_NAME = "wrong_name"
     ELSEWHERE = "elsewhere"
+    CREATABLE = "creatable"     # pusty plik-znacznik (size=0, np. .msu) — nie ma
+                                # go na miejscu, ale rebuilder go trywialnie
+                                # tworzy: liczymy jak „do naprawy", nie „brak"
     MISSING = "missing"
     NO_HASH = "no_hash"
 
@@ -54,6 +57,12 @@ class RomStatus:
     game_multi: bool = False    # gra wieloplikowa (CD bin/cue) => podkatalog
     archive_names_ok: bool = True  # via_archive: nazwy WEWN. zgodne z DAT-em
                                    # (False => przepakuj z poprawnymi nazwami)
+    archive_superset: bool = False  # źródłowe archiwum ma WIĘCEJ plików niż gra
+                                    # (np. MAME merged set: parent+klony) =>
+                                    # NIE przenosić całości, tylko WYPAKOWAĆ
+                                    # potrzebne ROM-y; źródła NIE kasować
+    is_translation: bool = False    # slot SPEŁNIONY świadomą podmianą na
+                                    # tłumaczenie (translations.json) — GUI 🌐
 
     @property
     def canonical_path(self) -> Path:
@@ -93,6 +102,7 @@ class DatReport:
         tak nie da się skompletować."""
         rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
                 RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+                RomState.CREATABLE: 2,
                 RomState.HAVE: 1, RomState.HAVE_CHD: 1}
         worst: dict[str, RomState] = {}
         for s in self.statuses:
@@ -103,7 +113,8 @@ class DatReport:
         for st in worst.values():
             if st in (RomState.HAVE, RomState.HAVE_CHD):
                 complete += 1
-            elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE):
+            elif st in (RomState.WRONG_NAME, RomState.ELSEWHERE,
+                        RomState.CREATABLE):
                 fix += 1
             else:
                 miss += 1
@@ -121,13 +132,15 @@ def game_stats_from_states(game_states: dict) -> tuple[int, int, int, int]:
     Wspólne dla żywego raportu i wczytanego cache."""
     rank = {RomState.MISSING: 3, RomState.NO_HASH: 3,
             RomState.WRONG_NAME: 2, RomState.ELSEWHERE: 2,
+            RomState.CREATABLE: 2,
             RomState.HAVE: 1, RomState.HAVE_CHD: 1}
     complete = fix = miss = 0
     for roms in game_states.values():
         worst = max(roms.values(), key=lambda st: rank[st])
         if worst in (RomState.HAVE, RomState.HAVE_CHD):
             complete += 1
-        elif worst in (RomState.WRONG_NAME, RomState.ELSEWHERE):
+        elif worst in (RomState.WRONG_NAME, RomState.ELSEWHERE,
+                       RomState.CREATABLE):
             fix += 1
         else:
             miss += 1
@@ -206,12 +219,27 @@ def match_rom(entry: DatEntry, game: str, rom: DatRom, index: FileIndex,
     dopasowanie CHD jest na poziomie GRY, patrz match_game).
 
     game_multi — gra wieloplikowa luzem => podkatalog per gra."""
+    # PUSTY plik-znacznik (np. .msu w MSU-1: size=0, crc="-"): brak sum, ale
+    # trywialnie odtwarzalny — 0 bajtów ma zawsze tę samą treść. HAVE, gdy leży
+    # na miejscu; inaczej CREATABLE (rebuilder utworzy pusty plik). CREATABLE
+    # liczy się jak „do naprawy", nie „brak" — bez tego gry MSU-1 (każda ma .msu)
+    # miały wieczne „brak", choć wszystkie realne pliki są.
+    if (rom.size or 0) == 0 and not rom.sha1 and not rom.md5:
+        status = RomStatus(entry, game, rom, RomState.CREATABLE,
+                           game_multi=game_multi)
+        try:
+            canon = status.canonical_path
+            if os.path.isfile(canon) and os.path.getsize(canon) == 0:
+                status.state = RomState.HAVE
+                status.source_path = str(canon)
+        except OSError:
+            pass
+        return status
     rows: list = []
     if rom.sha1:
         rows = index.find_sha1(rom.sha1, include_chd_content=False)
     if not rows and rom.md5:
-        rows = [r for r in index._db.execute(
-            "SELECT * FROM files WHERE missing=0 AND md5=?", (rom.md5.lower(),))]
+        rows = index.find_md5(rom.md5)
     if not rows and rom.crc and rom.size:
         rows = index.find_crc(rom.crc, rom.size)
     if not rows and not (rom.sha1 or rom.md5 or rom.crc):
@@ -304,35 +332,51 @@ def _match_game_archive(entry, game, index: FileIndex, want_ext, allow_move):
         # nazwa WEWNĄTRZ archiwum musi zgadzać się z nazwą ROM-a z DAT-a
         return all(members.get(i, "") == game.roms[i].name for i in need)
 
-    def _mk(archive, members, state, canonical, names_ok):
+    def _superset(archive: str) -> bool:
+        # archiwum ma WIĘCEJ plików niż gra potrzebuje (np. MAME merged set:
+        # parent + klony w podfolderach). Wtedy NIE wolno przenieść/skasować
+        # całości — trzeba WYPAKOWAĆ tylko ROM-y gry, źródło zostawić.
+        try:
+            n = index._db.execute(
+                "SELECT COUNT(*) FROM members WHERE archive=?",
+                (archive,)).fetchone()[0]
+        except Exception:
+            return False
+        return n > len(game.roms)
+
+    def _mk(archive, members, state, canonical, names_ok, superset=False):
         return [RomStatus(entry, game.name, rom, state, source_path=archive,
                           member=members.get(i, ""), via_archive=True,
-                          canonical_override=canonical, archive_names_ok=names_ok)
+                          canonical_override=canonical, archive_names_ok=names_ok,
+                          archive_superset=superset)
                 for i, rom in enumerate(game.roms)]
 
     in_dir = [(a, m) for a, m in full if _under(a, entry.target_dir)]
     if in_dir:
         in_dir.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
         archive, members = in_dir[0]
-        if _names_ok(members):
-            # w katalogu docelowym + poprawne nazwy wewnętrzne => zielone
+        sup = _superset(archive)
+        if _names_ok(members) and not sup:
+            # w katalogu docelowym + poprawne nazwy + DOKŁADNY zestaw => zielone
             return _mk(archive, members, RomState.HAVE, archive, True)
-        # zawartość poprawna, ale zła nazwa wewnątrz => PRZEPAKUJ (naprawa)
+        # złe nazwy ALBO nadzbiór (merged) => PRZEPAKUJ tylko ROM-y gry (naprawa)
         ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
         canonical = str(entry.target_dir / f"{game.name}.{ext}")
-        return _mk(archive, members, RomState.WRONG_NAME, canonical, False)
+        return _mk(archive, members, RomState.WRONG_NAME, canonical, False,
+                   superset=sup)
     if not allow_move:
         return None
     full.sort(key=lambda am: (0 if _names_ok(am[1]) else 1, am[0].lower()))
     archive, members = full[0]
+    sup = _superset(archive)
     ext = want_ext or (Path(archive).suffix.lstrip(".").lower() or "zip")
     canonical = str(entry.target_dir / f"{game.name}.{ext}")
     # kanoniczny zip DZIECKA jest już poprawnym linkiem na archiwum rodzica
     if _link_satisfies(canonical, archive):
         return _mk(archive, members, RomState.HAVE, canonical,
-                   _names_ok(members))
+                   _names_ok(members), superset=sup)
     return _mk(archive, members, RomState.ELSEWHERE, canonical,
-               _names_ok(members))
+               _names_ok(members), superset=sup)
 
 
 def _find_game_chd(game, index: FileIndex):
@@ -354,7 +398,8 @@ def _find_game_chd(game, index: FileIndex):
     return None
 
 
-def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
+def match_game(entry: DatEntry, game, index: FileIndex,
+               subs: Optional[dict] = None) -> list[RomStatus]:
     """Statusy wszystkich ROM-ów gry, ŚWIADOME formatu przechowywania.
 
     Kluczowe: format docelowy (``entry.store_format``) NADPISuje rozszerzenia
@@ -373,6 +418,25 @@ def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
     multi = len(game.roms) > 1 and getattr(entry, "subdir_per_game", True)
     statuses = [match_rom(entry, game.name, rom, index, game_multi=multi)
                 for rom in game.roms]
+
+    # PODMIANA na TŁUMACZENIE (translations.json = źródło prawdy): gra ma
+    # zapisany wybór → slot pod NAZWĄ KANONICZNĄ jest SPEŁNIONY przez wariant,
+    # mimo że jego treść ≠ sumy z podstawowego DAT-u. Bez tego skan cofałby
+    # świadomą podmianę. V1: gry jednoplikowe (jeden ROM danych).
+    if subs:
+        from .translations import sub_key
+        rec = subs.get(sub_key(entry.name, game.name))
+        if rec:
+            data_sts = [s for s in statuses
+                        if not s.rom.name.lower().endswith((".cue", ".gdi"))]
+            if len(data_sts) == 1:
+                canonical = data_sts[0].canonical_path
+                if os.path.lexists(canonical):
+                    for s in statuses:
+                        s.state = RomState.HAVE
+                        s.is_translation = True
+                    return statuses
+
     if all(s.state == RomState.HAVE for s in statuses):
         return statuses                       # luźne pliki już na miejscu
 
@@ -386,13 +450,20 @@ def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
         if arc is not None:
             return arc
 
+    # (3) format PŁYTOWY (chd/rvz): CHD ma PIERWSZEŃSTWO nad luźnymi ścieżkami.
+    # Bez tego DZIECKO (np. 1G1R), znajdując komplet luźnych ścieżek w ToSort
+    # ZIP-ie, wypakowywałoby je FIZYCZNIE do swojego katalogu — zamiast zrobić
+    # LINK do CHD rodzica. Gdy CHD (rodzica albo własny) istnieje → via_chd.
+    chd_row = _find_game_chd(game, index) if fmt in ("chd", "rvz") else None
+
     complete = all(s.state not in (RomState.MISSING, RomState.NO_HASH)
                    for s in statuses)
-    if complete:
-        return statuses
-    chd_row = _find_game_chd(game, index)
     if chd_row is None:
-        return statuses
+        if complete:
+            return statuses                 # luźne/member: przenieś/wypakuj/konwertuj
+        chd_row = _find_game_chd(game, index)   # ostatnia szansa (niekompletne)
+        if chd_row is None:
+            return statuses
     canonical = entry.target_dir / f"{game.name}.chd"
     src = chd_row["path"]
     if _same_path(src, str(canonical)) or _link_satisfies(canonical, src):
@@ -411,21 +482,25 @@ def match_game(entry: DatEntry, game, index: FileIndex) -> list[RomStatus]:
     return statuses
 
 
-def match_entry(entry: DatEntry, index: FileIndex) -> DatReport:
+def match_entry(entry: DatEntry, index: FileIndex,
+                subs: Optional[dict] = None) -> DatReport:
     entry.load()
     report = DatReport(entry)
     for game in entry.games:
-        report.statuses.extend(match_game(entry, game, index))
+        report.statuses.extend(match_game(entry, game, index, subs))
     return report
 
 
 def match_store(entries: Sequence[DatEntry], index: FileIndex,
-                log: Optional[callable] = None) -> list[DatReport]:
+                log: Optional[callable] = None,
+                subs: Optional[dict] = None) -> list[DatReport]:
+    """`subs` — mapa podmian na tłumaczenia (klucz `sub_key(dat,gra)` → wpis);
+    zwykle `TranslationStore._subs`. Gry z wpisem są SPEŁNIONE tłumaczeniem."""
     reports = []
     for e in entries:
         if log:
             log(f"DAT: {e.name}")
-        reports.append(match_entry(e, index))
+        reports.append(match_entry(e, index, subs))
     return reports
 
 

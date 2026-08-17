@@ -133,7 +133,8 @@ class MainWindow(QMainWindow):
         self._dat_index = None       # indeks DAT budowany na starcie batcha
         self.chd: Optional[CHDMan] = None
 
-        self.setWindowTitle(tr("CHD Buddy"))
+        from .. import __version__ as _ver
+        self.setWindowTitle(tr("CHD Buddy") + f"  v{_ver}")
         self.resize(1040, 680)
         self._build_ui()
         self.setAcceptDrops(True)

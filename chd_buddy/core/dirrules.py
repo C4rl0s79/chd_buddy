@@ -50,6 +50,10 @@ DEFAULT_RULES: dict[str, Any] = {
     "subdir_per_game": True,
     # Podmieniaj wersje (Japan) na fanowskie tłumaczenia (T-En) z innych DAT-ów.
     "prefer_translations": False,
+    # ROLA DAT-u: "collection" (zwykły cel: parent/child) albo "translations"
+    # (pula fanowskich tłumaczeń — nie cel podstawowy, dostarcza wariantów do
+    # podmiany innych DAT-ów; patrz core/translations.py).
+    "role": "collection",
     # Format przechowywania (patrz FORMATS).
     "format": "keep",
     # Konwencja nazw katalogów per system (patrz NAMINGS).
@@ -146,7 +150,7 @@ def suggest_format(system_short: str) -> str:
 
 
 # Reguły tekstowe (reszta jest boolowska).
-_STR_RULES = {"target", "format", "naming", "rom_root", "platform"}
+_STR_RULES = {"target", "format", "naming", "rom_root", "platform", "role"}
 
 
 def _coerce(name: str, value):

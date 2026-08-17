@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 CREATE INDEX IF NOT EXISTS idx_files_sha1 ON files(sha1);
 CREATE INDEX IF NOT EXISTS idx_files_crc32 ON files(crc32);
+CREATE INDEX IF NOT EXISTS idx_files_md5 ON files(md5);
 CREATE INDEX IF NOT EXISTS idx_files_data_sha1 ON files(data_sha1);
 CREATE TABLE IF NOT EXISTS members (
     id INTEGER PRIMARY KEY,
@@ -73,6 +74,7 @@ CREATE TABLE IF NOT EXISTS members (
 );
 CREATE INDEX IF NOT EXISTS idx_members_crc ON members(crc32, size);
 CREATE INDEX IF NOT EXISTS idx_members_sha1 ON members(sha1);
+CREATE INDEX IF NOT EXISTS idx_members_archive ON members(archive);
 """
 
 # Archiwa, których zawartość indeksujemy (CRC32+rozmiar z metadanych —
@@ -88,11 +90,54 @@ def default_db_path() -> Path:
     return app_base_dir() / INDEX_DB_FILENAME
 
 
-def hash_file(path: Path) -> tuple[str, str, str]:
-    """Liczy (crc32, md5, sha1) w jednym przebiegu po pliku."""
+def count_files(root: Path, cancel=None) -> int:
+    """Szybko liczy pliki pod `root` (sam scandir, bez stat/hashowania) — daje
+    MIANOWNIK do paska „plik X z Y". Pomija artefakty tymczasowe i NIE wchodzi
+    w dowiązane katalogi (jak `_walk`)."""
+    n = 0
+    stack = [Path(root)]
+    while stack:
+        if cancel is not None and cancel.is_set():
+            break
+        d = stack.pop()
+        try:
+            it = os.scandir(d)
+        except OSError:
+            continue
+        with it:
+            for e in it:
+                try:
+                    is_dir = e.is_dir(follow_symlinks=False)
+                except OSError:
+                    continue
+                if _is_temp_artifact(e.name, is_dir):
+                    continue
+                if is_dir:
+                    try:
+                        if is_reparse_stat(e.stat(follow_symlinks=False)):
+                            continue          # link do katalogu — nie wchodzimy
+                    except OSError:
+                        continue
+                    stack.append(Path(e.path))
+                else:
+                    n += 1
+    return n
+
+
+def hash_file(path: Path, on_progress=None) -> tuple[str, str, str]:
+    """Liczy (crc32, md5, sha1) w jednym przebiegu po pliku.
+
+    on_progress(done_bytes, total_bytes) — wołane co porcję, żeby GUI pokazało
+    postęp BAJTOWY w obrębie jednego wielkiego pliku (CHD/ISO po kilka GB, gdzie
+    samo liczenie sum trwa minuty)."""
     crc = 0
     md5 = hashlib.md5()
     sha1 = hashlib.sha1()
+    try:
+        total = os.path.getsize(path)
+    except OSError:
+        total = 0
+    done = 0
     with open(path, "rb") as fh:
         while True:
             chunk = fh.read(_HASH_CHUNK)
@@ -101,6 +146,9 @@ def hash_file(path: Path) -> tuple[str, str, str]:
             crc = zlib.crc32(chunk, crc)
             md5.update(chunk)
             sha1.update(chunk)
+            if on_progress is not None:
+                done += len(chunk)
+                on_progress(done, total)
     return f"{crc & 0xFFFFFFFF:08x}", md5.hexdigest(), sha1.hexdigest()
 
 
@@ -198,6 +246,10 @@ class FileIndex:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(self.db_path))
         self._db.row_factory = sqlite3.Row
+        # cache dopasowania w PAMIĘCI (słowniki po sumach) — dziesiątki tysięcy
+        # zapytań SELECT przy matchingu całej kolekcji to minuty; wczytanie
+        # indeksu raz i dopasowanie w RAM to sekundy. None => nieaktywny.
+        self._mcache = None
         self._db.executescript(_SCHEMA)
         # migracja starych baz (CREATE IF NOT EXISTS nie dodaje kolumn)
         try:
@@ -228,6 +280,7 @@ class FileIndex:
         exts: Optional[set[str]] = None,
         chd_prober: Optional[ChdProber] = None,
         on_file: Optional[FileCB] = None,
+        detail: Optional[Callable[[int, int, str], None]] = None,
         log: Optional[Callable[[str], None]] = None,
         cancel=None,
     ) -> ScanStats:
@@ -296,12 +349,20 @@ class FileIndex:
                         if ds:
                             cur.execute("UPDATE files SET data_sha1=? WHERE path=?", (ds, key))
                             pending += 1
-                    # backfill członków archiwum (baza sprzed tej funkcji)
+                    # backfill/UPGRADE członków archiwum: brak członków ALBO
+                    # członkowie bez SHA-1 (stary skan szybki = tylko CRC) →
+                    # doskanuj PEŁNIE (SHA-1 zawartości). „Zawsze wiemy co
+                    # dokładnie mamy" — nie ufamy samemu CRC przy operacjach.
                     if path.suffix.lower().lstrip(".") in ARCHIVE_EXTS:
                         n = cur.execute("SELECT COUNT(*) FROM members WHERE archive=?",
                                         (key,)).fetchone()[0]
-                        if n == 0:
-                            pending += self._index_members(cur, key, path, log)
+                        no_sha = cur.execute(
+                            "SELECT COUNT(*) FROM members WHERE archive=? AND "
+                            "(sha1='' OR sha1 IS NULL)", (key,)).fetchone()[0]
+                        if n == 0 or no_sha:
+                            cur.execute("DELETE FROM members WHERE archive=?", (key,))
+                            pending += self._index_members(cur, key, path, log,
+                                                           full=True)
                 else:
                     # PLIK PRZENIESIONY (np. ręcznie w Eksploratorze)?
                     # Wiedza podąża za treścią: ta sama nazwa + rozmiar +
@@ -313,7 +374,9 @@ class FileIndex:
                             pending += 1
                             continue
                     try:
-                        crc, md5, sha1 = hash_file(path)
+                        _dcb = ((lambda dn, tt: detail(dn, tt, path.name))
+                                if detail is not None else None)
+                        crc, md5, sha1 = hash_file(path, on_progress=_dcb)
                     except OSError as e:
                         stats.errors += 1
                         if log:
@@ -338,11 +401,12 @@ class FileIndex:
                     pending += 1
                     if path.suffix.lower().lstrip(".") in ARCHIVE_EXTS:
                         cur.execute("DELETE FROM members WHERE archive=?", (key,))
-                        # skan pełny: wypakuj i policz SHA-1 członków (weryfikacja
-                        # zawartości + trwały odcisk); skan szybki: tylko CRC32
-                        # z centralnego katalogu (bez dekompresji).
+                        # NOWE/ZMIENIONE archiwum zawsze skanujemy PEŁNIE (SHA-1
+                        # zawartości) — nieznanego pliku nie wolno „poznać" po
+                        # samym CRC z nagłówka; przy przenoszeniu/naprawie
+                        # musimy wiedzieć DOKŁADNIE co jest w środku.
                         pending += self._index_members(cur, key, path, log,
-                                                       full=full)
+                                                       full=True)
 
             if pending >= 200:  # commituj partiami — długi skan NAS nie przepada
                 self._db.commit()
@@ -562,15 +626,62 @@ class FileIndex:
         key = str(Path(os.path.abspath(path)))
         return self._db.execute("SELECT * FROM files WHERE path=?", (key,)).fetchone()
 
+    def build_match_cache(self) -> None:
+        """Wczytuje CAŁY indeks (obecne pliki + członków archiwów) do słowników
+        w PAMIĘCI po sumach. Dopasowanie całej kolekcji robi dziesiątki tysięcy
+        SELECT-ów (minuty); z cache to lookupy w RAM (sekundy). Ważny TYLKO na
+        czas dopasowania — po zmianach w indeksie wywołaj `drop_match_cache`."""
+        by_sha1: dict = {}
+        by_crc: dict = {}
+        by_md5: dict = {}
+        by_data: dict = {}
+        for r in self._db.execute("SELECT * FROM files WHERE missing=0"):
+            if r["sha1"]:
+                by_sha1.setdefault(r["sha1"], []).append(r)
+            if r["crc32"] and r["size"] is not None:
+                by_crc.setdefault((r["crc32"], r["size"]), []).append(r)
+            if r["md5"]:
+                by_md5.setdefault(r["md5"], []).append(r)
+            if r["data_sha1"]:
+                by_data.setdefault(r["data_sha1"], []).append(r)
+        m_sha: dict = {}
+        m_crc: dict = {}
+        for r in self._db.execute(
+                "SELECT m.* FROM members m JOIN files f ON f.path = m.archive "
+                "WHERE f.missing=0"):
+            if r["sha1"]:
+                m_sha.setdefault(r["sha1"], []).append(r)
+            if r["crc32"] and r["size"] is not None:
+                m_crc.setdefault((r["crc32"], r["size"]), []).append(r)
+        self._mcache = {"sha1": by_sha1, "crc": by_crc, "md5": by_md5,
+                        "data": by_data, "msha": m_sha, "mcrc": m_crc}
+
+    def drop_match_cache(self) -> None:
+        self._mcache = None
+
     def find_sha1(self, sha1: str, include_chd_content: bool = True) -> list[sqlite3.Row]:
         """Pliki o danym SHA-1 (opcjonalnie także trafienia w zawartość CHD)."""
+        s = sha1.lower()
+        if self._mcache is not None:
+            res = list(self._mcache["sha1"].get(s, ()))
+            if include_chd_content:
+                res += self._mcache["data"].get(s, ())
+            return res
         q = "SELECT * FROM files WHERE missing=0 AND (sha1=?"
-        args: list[str] = [sha1.lower()]
+        args: list[str] = [s]
         if include_chd_content:
             q += " OR data_sha1=?"
-            args.append(sha1.lower())
+            args.append(s)
         q += ")"
         return self._db.execute(q, args).fetchall()
+
+    def find_md5(self, md5: str) -> list[sqlite3.Row]:
+        """Pliki o danym MD5 (fallback gdy DAT nie ma/nie trafił SHA-1)."""
+        m = md5.lower()
+        if self._mcache is not None:
+            return list(self._mcache["md5"].get(m, ()))
+        return self._db.execute(
+            "SELECT * FROM files WHERE missing=0 AND md5=?", (m,)).fetchall()
 
     def duplicate_groups(self, min_size: int = 1) -> list[DupGroup]:
         """Grupy identycznych plików fizycznych (ten sam SHA-1 i rozmiar)."""
@@ -592,24 +703,33 @@ class FileIndex:
 
     def find_crc(self, crc32: str, size: int) -> list[sqlite3.Row]:
         """Pliki o danym CRC32 i rozmiarze (fallback, gdy DAT nie ma SHA-1)."""
+        c = crc32.lower().zfill(8)
+        if self._mcache is not None:
+            return list(self._mcache["crc"].get((c, size), ()))
         return self._db.execute(
             "SELECT * FROM files WHERE missing=0 AND crc32=? AND size=?",
-            (crc32.lower().zfill(8), size),
+            (c, size),
         ).fetchall()
 
     def find_member_crc(self, crc32: str, size: int) -> list[sqlite3.Row]:
         """Pliki WEWNĄTRZ archiwów o danym CRC32+rozmiarze (archiwum obecne)."""
+        c = crc32.lower().zfill(8)
+        if self._mcache is not None:
+            return list(self._mcache["mcrc"].get((c, size), ()))
         return self._db.execute(
             "SELECT m.* FROM members m JOIN files f ON f.path = m.archive "
             "WHERE f.missing=0 AND m.crc32=? AND m.size=?",
-            (crc32.lower().zfill(8), size),
+            (c, size),
         ).fetchall()
 
     def find_member_sha1(self, sha1: str) -> list[sqlite3.Row]:
+        s = sha1.lower()
+        if self._mcache is not None:
+            return list(self._mcache["msha"].get(s, ()))
         return self._db.execute(
             "SELECT m.* FROM members m JOIN files f ON f.path = m.archive "
             "WHERE f.missing=0 AND m.sha1=?",
-            (sha1.lower(),),
+            (s,),
         ).fetchall()
 
     def member_name_in(self, archive: str, sha1: str, crc: str,

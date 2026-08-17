@@ -52,8 +52,12 @@ class Settings:
     work_dir: str = ""
     # Kompresja: "default" => niech chdman wybierze wg polecenia.
     compression_preset: str = "default"   # CHD: kodeki (patrz presets.py)
-    # ZIP: poziom DEFLATE 0–9 (0=bez kompresji, 6=domyślny zlib, 9=maks).
+    # ZIP: poziom 0–9 (0=bez kompresji, 6=domyślny, 9=maks).
     zip_level: int = 6
+    # Metoda kompresji ZIP: "deflate" (zgodne z KAŻDYM emulatorem/scraperem)
+    # albo "zstd" (mniejszy plik, ale wiele narzędzi go NIE czyta — „Failed to
+    # inflate"). Domyślnie deflate dla kompatybilności.
+    zip_method: str = "deflate"
     # RVZ (DolphinTool): poziom zstd 1–22 (5=domyślny) i rozmiar bloku w KB.
     rvz_level: int = 5
     rvz_block_kb: int = 128

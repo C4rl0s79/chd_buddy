@@ -499,7 +499,9 @@ def test_rebuild_unpacks_from_7z(world):
 
 
 def test_rebuild_zip_verification_rejects_bad_content(world):
-    """CRC się zgadza (kolizja/celowo), ale SHA-1 nie => plik NIE ląduje."""
+    """Zła zawartość (CRC sfałszowany na zgodny, ale SHA-1 inny) NIE jest
+    dopasowana — bo NOWE archiwa skanujemy PEŁNIE (SHA-1 zawartości), więc
+    kłamstwo w CRC nie przechodzi. Gra = brak, nic nie ląduje."""
     import zipfile
     import zlib
     idx = world["idx"]
@@ -510,8 +512,8 @@ def test_rebuild_zip_verification_rejects_bad_content(world):
     fake = b"INNE DANE" * 64
     with zipfile.ZipFile(zpath, "w") as zf:
         zf.writestr("Gra A.iso", fake)
-    idx.scan(world["src"])
-    # sfałszuj wpis membera tak, by CRC+rozmiar pasowały do DAT-a
+    idx.scan(world["src"])                 # pełny skan członków → realny SHA-1
+    # sfałszuj CRC+rozmiar na zgodne z DAT-em — ale SHA-1 (policzony) zdradza
     good = world["only_a"]
     idx._db.execute(
         "UPDATE members SET crc32=?, size=? WHERE archive=?",
@@ -520,9 +522,8 @@ def test_rebuild_zip_verification_rejects_bad_content(world):
 
     reports = match_store(entries, idx)
     s = [s for r in reports for s in r.statuses if s.rom.name == "Gra A.iso"][0]
-    assert s.state == RomState.ELSEWHERE and s.member
+    assert s.state == RomState.MISSING     # SHA-1 nie pasuje → NIE dopasowane
     st = Rebuilder(idx, dry_run=False).run(reports)
-    assert st.errors == 1 and st.unpacked == 0
     assert not (world["rom_root"] / "PS2" / "Zestaw A" / "Gra A.iso").exists()
 
 
@@ -886,3 +887,510 @@ def test_rebuild_cancel_skips_clean_and_dedup(world):
                 delete_placed_from=[world["src"]], cancel=cancel)
     assert rb.cancelled is True
     assert st.tosorted == 0 and st.deduped == 0 and st.tosort_deleted == 0
+
+
+def test_empty_marker_rom_created_and_matched(tmp_path: Path):
+    """Gra MSU-1: obok .sfc jest pusty plik-znacznik .msu (size=0, crc="-",
+    bez sum). Matcher: MISSING gdy go brak, HAVE gdy leży (0 bajtów). Rebuilder
+    TWORZY pusty plik → gra staje się kompletna (bez tego DAT MSU-1 nigdy nie
+    dawał się odtworzyć)."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    src = tmp_path / "src"; src.mkdir()
+    sfc = b"SNES-ROM-DANE" * 100
+    # DAT ręcznie — pusty .msu ma size=0 i crc="-" (BEZ md5/sha1)
+    (dat_root / "msu").mkdir(parents=True)
+    (dat_root / "msu" / "msu.dat").write_text(
+        '<?xml version="1.0"?><datafile><header><name>msu</name></header>'
+        '<game name="gra (usa) (msu1)">'
+        f'<rom name="gra (usa) (msu1).sfc" {_rom_attrs(sfc)}/>'
+        '<rom name="gra (usa) (msu1).msu" size="0" crc="-"/>'
+        '</game></datafile>', encoding="utf-8")
+    # źródło: tylko .sfc (pod właściwą nazwą, w podkatalogu gry docelowej)
+    gdir = rom_root / "msu" / "gra (usa) (msu1)"
+    gdir.mkdir(parents=True)
+    (gdir / "gra (usa) (msu1).sfc").write_bytes(sfc)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    g = reports[0]
+    # PRZED: .msu = CREATABLE (pusty marker do utworzenia, NIE „brak"),
+    # .sfc obecny (gdzieś)
+    by = {s.rom.name: s.state for s in g.statuses}
+    assert by["gra (usa) (msu1).msu"] == RomState.CREATABLE
+    assert by["gra (usa) (msu1).sfc"] != RomState.MISSING
+    # gra NIE liczy się jako „brak" — pusty marker to „do naprawy"
+    _tot, _comp, _fix, _miss = g.game_stats()
+    assert _miss == 0 and _fix >= 1
+
+    rb = Rebuilder(idx, tosort=None, dry_run=False)
+    st = rb.run(reports)
+    assert st.created == 1
+    # pusty plik-znacznik powstał w ścieżce KANONICZNEJ .msu
+    msu = g.statuses[[s.rom.name for s in g.statuses].index(
+        "gra (usa) (msu1).msu")].canonical_path
+    assert Path(msu).is_file() and Path(msu).stat().st_size == 0
+
+    # PO: przeskanuj i dopasuj ponownie — gra KOMPLETNA (wszystko HAVE)
+    idx.scan(rom_root)
+    reports2 = match_store(DatStore(dat_root, rom_root).discover(), idx)
+    by2 = {s.rom.name: s.state for s in reports2[0].statuses}
+    assert by2["gra (usa) (msu1).msu"] == RomState.HAVE
+    assert all(s.state == RomState.HAVE for s in reports2[0].statuses)
+
+
+def test_empty_marker_dry_run_creates_nothing(tmp_path: Path):
+    """Podgląd (dry_run) NIE tworzy pustego pliku-znacznika."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    (dat_root / "msu").mkdir(parents=True)
+    sfc = b"X" * 50
+    (dat_root / "msu" / "msu.dat").write_text(
+        '<?xml version="1.0"?><datafile><header><name>msu</name></header>'
+        '<game name="g (msu1)">'
+        f'<rom name="g (msu1).sfc" {_rom_attrs(sfc)}/>'
+        '<rom name="g (msu1).msu" size="0" crc="-"/>'
+        '</game></datafile>', encoding="utf-8")
+    gdir = rom_root / "msu" / "g (msu1)"; gdir.mkdir(parents=True)
+    (gdir / "g (msu1).sfc").write_bytes(sfc)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    reports = match_store(DatStore(dat_root, rom_root).discover(), idx)
+    rb = Rebuilder(idx, tosort=None, dry_run=True)
+    st = rb.run(reports)
+    assert st.created == 1                       # policzone w podglądzie
+    assert not (gdir / "g (msu1).msu").exists()  # ale plik NIE powstał
+
+
+def test_claim_key_uses_all_dat_sums():
+    """Dedup łączy dwa ROM-y w jedną kopię fizyczną (link) TYLKO, gdy zgadzają
+    się WSZYSTKIE sumy z DAT (size+CRC+MD5+SHA-1). Sam zgodny SHA-1 przy innym
+    CRC/rozmiarze → RÓŻNE klucze (osobne kopie), nie błędny link."""
+    from chd_buddy.core.datfile import DatRom
+    from chd_buddy.core.matcher import RomStatus, RomState
+    from chd_buddy.core.rebuilder import _claim_key
+
+    def st(name, size, crc, md5, sha1):
+        return RomStatus(None, "g", DatRom(name, size, crc, md5, sha1),
+                         RomState.ELSEWHERE)
+
+    a = st("a.pcm", 100, "aabbccdd", "d0"*16, "11"*20)
+    b = st("b.pcm", 100, "aabbccdd", "d0"*16, "11"*20)   # WSZYSTKO równe
+    assert _claim_key(a) == _claim_key(b)                # → jedna kopia + link
+
+    # ten sam SHA-1, ale INNY rozmiar → różne klucze (osobne kopie)
+    c = st("c.pcm", 999, "aabbccdd", "d0"*16, "11"*20)
+    assert _claim_key(a) != _claim_key(c)
+    # ten sam SHA-1, ale INNY CRC → różne klucze
+    d = st("d.pcm", 100, "99999999", "d0"*16, "11"*20)
+    assert _claim_key(a) != _claim_key(d)
+    # ten sam SHA-1, ale INNY MD5 → różne klucze
+    e = st("e.pcm", 100, "aabbccdd", "ff"*16, "11"*20)
+    assert _claim_key(a) != _claim_key(e)
+    # klucz zawiera wszystkie sumy
+    assert "size=100" in _claim_key(a) and "crc=aabbccdd" in _claim_key(a)
+    assert "md5=" in _claim_key(a) and "sha1=" in _claim_key(a)
+
+
+def test_intra_dat_duplicate_is_copy_not_symlink(tmp_path: Path):
+    """PARENT bez symlinków: dwie gry w JEDNYM DAT-cie o identycznej treści →
+    OBIE dostają fizyczną kopię (dedup wewnątrz kolekcji NIE linkuje). Symlink
+    zostaje tylko dziecko→rodzic (inny katalog docelowy — patrz world)."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    tosort = tmp_path / "ts"; tosort.mkdir()
+    shared = b"WSPOLNA-TRESC-DWOCH-GIER" * 40
+    _write_dat(dat_root / "S" / "s.dat", "Zestaw S",
+               {"Gra One": {"Gra One.rom": shared},
+                "Gra Two": {"Gra Two.rom": shared}})
+    (tosort / "gra_one.rom").write_bytes(shared)
+    (tosort / "gra_two.rom").write_bytes(shared)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tosort)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    rb = Rebuilder(idx, tosort=tosort, dry_run=False)
+    st = rb.run(reports)
+
+    d = rom_root / "S" / "Zestaw S"
+    one = d / "Gra One.rom"; two = d / "Gra Two.rom"
+    assert one.is_file() and two.is_file()
+    assert not is_link(one) and not is_link(two)     # OBIE fizyczne, żaden link
+    assert one.read_bytes() == shared and two.read_bytes() == shared
+    assert st.linked == 0                            # zero symlinków w parent
+
+
+def test_intra_dat_dedup_phase_keeps_physical(tmp_path: Path):
+    """Faza dedupu też NIE zamienia kopii na symlinki WEWNĄTRZ jednej kolekcji
+    (parent): dwie identyczne kopie w tym samym DAT-cie zostają fizyczne."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    shared = b"IDENTYCZNA" * 100
+    _write_dat(dat_root / "S" / "s.dat", "Zestaw S",
+               {"A": {"A.rom": shared}, "B": {"B.rom": shared}})
+    # obie już fizycznie na miejscu (dwie kopie)
+    d = rom_root / "S" / "Zestaw S"; d.mkdir(parents=True)
+    (d / "A.rom").write_bytes(shared)
+    (d / "B.rom").write_bytes(shared)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    rb = Rebuilder(idx, dry_run=False)
+    st = rb.run(reports, dedup_roots=[rom_root])
+    assert not is_link(d / "A.rom") and not is_link(d / "B.rom")  # obie fizyczne
+    assert st.deduped == 0                           # dedup nic nie polinkował
+
+
+def test_purge_redundant_tosort_archives_any_format(tmp_path: Path):
+    """Zbędne ARCHIWUM w ToSort (cała zawartość już w kolekcji) kasowane
+    NIEZALEŻNIE od formatu (gra luźna, nie CHD). Śmieci .srm nie blokują;
+    archiwum z UNIKALNYM plikiem zostaje; nieznana zawartość (brak członków
+    w indeksie) nietykalna."""
+    import zipfile
+    from chd_buddy.core.rebuilder import Rebuilder
+    rom_root = tmp_path / "roms"; tosort = tmp_path / "ts"; tosort.mkdir()
+    a = b"SFC-DANE" * 200; b = b"PCM-DANE" * 300; c = b"UNIKAT" * 100
+    # target: a i b luźno (już w kolekcji)
+    tdir = rom_root / "snes-msu1" / "Gra (MSU1)"; tdir.mkdir(parents=True)
+    (tdir / "Gra (MSU1).sfc").write_bytes(a)
+    (tdir / "Gra (MSU1)-1.pcm").write_bytes(b)
+    # ToSort: ZIP redundantny (a+b + śmieć .srm + pusty .msu) i ZIP z unikatem
+    zdup = tosort / "Gra (MSU1).zip"
+    with zipfile.ZipFile(zdup, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Gra (MSU1).sfc", a)
+        z.writestr("Gra (MSU1)-1.pcm", b)
+        z.writestr("Gra (MSU1).srm", b"SAVE-USERA")   # śmieć spoza DAT
+        z.writestr("Gra (MSU1).msu", b"")             # pusty marker
+    zuniq = tosort / "Inna (MSU1).zip"
+    with zipfile.ZipFile(zuniq, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Inna (MSU1).sfc", c)              # NIE ma w target
+        z.writestr("Inna (MSU1)-1.pcm", b)            # to jest w target
+    idx = FileIndex(tmp_path / "idx.sqlite3")
+    idx.scan(rom_root)
+    idx.scan(tosort, full=True)                       # członkowie z SHA-1
+
+    rb = Rebuilder(idx, dry_run=False)
+    rb._purge_redundant_tosort_archives([tosort])
+    assert not zdup.exists()          # cała zawartość ROM w target → skasowany
+    assert zuniq.exists()             # ma unikat (.sfc) → został
+    assert idx.lookup(zdup) is None   # znikł też z indeksu
+    assert rb.stats.tosort_deleted == 1
+
+
+def test_purge_redundant_tosort_archives_dry_run(tmp_path: Path):
+    """dry_run: liczy, ale NIE kasuje archiwum."""
+    import zipfile
+    from chd_buddy.core.rebuilder import Rebuilder
+    rom_root = tmp_path / "roms"; tosort = tmp_path / "ts"; tosort.mkdir()
+    a = b"X" * 500
+    tdir = rom_root / "sys" / "G"; tdir.mkdir(parents=True)
+    (tdir / "G.rom").write_bytes(a)
+    z = tosort / "G.zip"
+    with zipfile.ZipFile(z, "w", zipfile.ZIP_DEFLATED) as zz:
+        zz.writestr("G.rom", a)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root); idx.scan(tosort, full=True)
+    rb = Rebuilder(idx, dry_run=True)
+    rb._purge_redundant_tosort_archives([tosort])
+    assert z.exists()                 # dry_run nic nie kasuje
+    assert rb.stats.tosort_deleted == 1
+
+
+def test_repair_normalizes_zip_compression_to_deflate(tmp_path: Path):
+    """Zmiana ustawienia „metoda ZIP = deflate" egzekwowana przy naprawie:
+    docelowy ZIP z inną kompresją (BZIP2/ZSTD) jest przepakowany na DEFLATE.
+    ZIP już-deflate — nietknięty."""
+    import zipfile
+    from chd_buddy.core.convert import zip_needs_repack
+    rom_root = tmp_path / "roms"
+    d = rom_root / "n64"; d.mkdir(parents=True)
+    a = b"ROM-N64" * 3000
+    with zipfile.ZipFile(d / "Gra (USA).zip", "w", zipfile.ZIP_BZIP2) as z:
+        z.writestr("Gra (USA).z64", a)          # inna metoda (BZIP2)
+    with zipfile.ZipFile(d / "OK (USA).zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("OK (USA).z64", b"X" * 100)  # już deflate
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+
+    rb = Rebuilder(idx, dry_run=False, zip_method="deflate")
+    rb._normalize_target_zip_compression([d / "Gra (USA).zip",
+                                          d / "OK (USA).zip"])
+    assert rb.stats.repacked == 1
+    assert not zip_needs_repack(d / "Gra (USA).zip", "deflate")   # naprawiony
+    assert not zip_needs_repack(d / "OK (USA).zip", "deflate")    # był OK
+    with zipfile.ZipFile(d / "Gra (USA).zip") as z:
+        assert z.read("Gra (USA).z64") == a                        # treść OK
+
+
+def test_normalize_skips_incomplete_game_zip(tmp_path: Path):
+    """Bezpiecznik: normalizacja/repack NIE rusza zipa gry NIEKOMPLETNEJ
+    (np. arcade parent bez własnych ROM-ów). `_complete_zip_canonicals`
+    zwraca tylko kanoniczne gier w pełni obecnych."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    good = b"KOMPLET" * 100
+    _write_dat(dat_root / "sys" / "s.dat", "Sys",
+               {"Pelna": {"Pelna.rom": good},
+                "Braki": {"Braki-a.rom": b"A" * 50, "Braki-b.rom": b"B" * 50}})
+    d = rom_root / "sys" / "Sys"; d.mkdir(parents=True)
+    # Pelna: kompletna (zip w docelowym); Braki: tylko 1 z 2 plików
+    import zipfile
+    with zipfile.ZipFile(d / "Pelna.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Pelna.rom", good)
+    (d / "Braki").mkdir()
+    (d / "Braki" / "Braki-a.rom").write_bytes(b"A" * 50)   # brak Braki-b
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    rb = Rebuilder(idx, dry_run=False, zip_method="deflate")
+    canon = rb._complete_zip_canonicals(reports)
+    names = {Path(p).name for p in canon}
+    assert "Pelna.zip" in names           # kompletna → kwalifikuje się
+    assert not any("Braki" in n for n in names)   # niekompletna → pominięta
+
+
+def test_repair_normalizes_zip_compression_to_zstd_if_available(tmp_path: Path):
+    """Symetrycznie: gdy user wybierze „metoda ZIP = zstd", naprawa przepakowuje
+    docelowe DEFLATE- y na ZSTD (wszystkie zmiany DAT odzwierciedlane)."""
+    import zipfile
+    if getattr(zipfile, "ZIP_ZSTANDARD", None) is None:
+        pytest.skip("Python bez ZIP_ZSTANDARD (<3.14)")
+    from chd_buddy.core.convert import zip_needs_repack
+    rom_root = tmp_path / "roms"; d = rom_root / "n64"; d.mkdir(parents=True)
+    a = b"ROM" * 5000
+    with zipfile.ZipFile(d / "G.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("G.z64", a)                  # deflate → ma zostać zstd
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    rb = Rebuilder(idx, dry_run=False, zip_method="zstd")
+    rb._normalize_target_zip_compression([d / "G.zip"])
+    assert rb.stats.repacked == 1
+    assert not zip_needs_repack(d / "G.zip", "zstd")
+    with zipfile.ZipFile(d / "G.zip") as z:
+        assert z.infolist()[0].compress_type == zipfile.ZIP_ZSTANDARD
+        assert z.read("G.z64") == a
+
+
+def test_match_cache_same_results_and_faster(world):
+    """Cache dopasowania w pamięci daje IDENTYCZNE stany co ścieżka SQL
+    (find_sha1/find_crc/find_md5/find_member_*), tylko bez zapytań na grę."""
+    idx = world["idx"]
+    entries = DatStore(world["dat_root"], world["rom_root"]).discover()
+    # bez cache (SQL)
+    rep_sql = match_store(entries, idx)
+    states_sql = [[(s.rom.name, s.state) for s in r.statuses] for r in rep_sql]
+    # z cache w pamięci
+    idx.build_match_cache()
+    try:
+        rep_cache = match_store(entries, idx)
+    finally:
+        idx.drop_match_cache()
+    states_cache = [[(s.rom.name, s.state) for s in r.statuses]
+                    for r in rep_cache]
+    assert states_cache == states_sql
+    assert idx._mcache is None                 # zwolniony
+
+
+def test_find_md5_matches(tmp_path: Path):
+    """find_md5 znajduje plik po MD5 (fallback), z cache i bez."""
+    rom = tmp_path / "g.rom"; rom.write_bytes(b"DANE-MD5" * 50)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tmp_path)
+    row = idx.lookup(rom)
+    md5 = row["md5"]
+    assert idx.find_md5(md5) and idx.find_md5(md5)[0]["path"] == str(rom)
+    idx.build_match_cache()
+    try:
+        assert idx.find_md5(md5)[0]["path"] == str(rom)   # z cache to samo
+        assert idx.find_md5("0" * 32) == []
+    finally:
+        idx.drop_match_cache()
+
+
+def test_merged_superset_archive_repacks_and_keeps_source(tmp_path: Path):
+    """ARCHIWUM-NADZBIÓR w ToSort (np. MAME merged: ROM-y gry + cudze) → naprawa
+    WYPAKOWUJE tylko ROM-y gry do docelowego ZIP-a i NIE KASUJE źródła
+    (zawiera ROM-y innych gier). To był błąd: przeniesienie całości + usunięcie
+    źródła „jakby ukończył naprawę"."""
+    import zipfile
+    from chd_buddy.core.matcher import match_store, RomState
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    tosort = tmp_path / "ts"; tosort.mkdir()
+    a1 = b"GRA-A-ROM-1" * 100; a2 = b"GRA-A-ROM-2" * 100
+    x1 = b"INNA-GRA-ROM" * 100
+    _write_dat(dat_root / "sys" / "s.dat", "Sys",
+               {"gra_a": {"a1.rom": a1, "a2.rom": a2}})
+    # merged: ROM-y gra_a (poprawne nazwy) + CUDZY rom (nadzbiór)
+    merged = tosort / "merged.zip"
+    with zipfile.ZipFile(merged, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("a1.rom", a1); z.writestr("a2.rom", a2)
+        z.writestr("clone/x1.rom", x1)          # plik innej gry → nadzbiór
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tosort, full=True)
+    entries = DatStore(dat_root, rom_root).discover()
+
+    def rules_fn(e):
+        from chd_buddy.core.dirrules import DEFAULT_RULES
+        r = dict(DEFAULT_RULES); r["format"] = "zip"; return r
+    for e in entries:
+        e.store_format = "zip"
+    reports = match_store(entries, idx)
+    # gra_a rozpoznana jako nadzbiór (via_archive, superset)
+    sts = reports[0].statuses
+    assert all(s.via_archive and s.archive_superset for s in sts)
+
+    rb = Rebuilder(idx, dry_run=False, log=lambda m: None)
+    rb.run(reports, rules=rules_fn)
+    dest = entries[0].target_dir / "gra_a.zip"
+    assert dest.is_file()
+    with zipfile.ZipFile(dest) as z:
+        names = set(z.namelist())
+        assert names == {"a1.rom", "a2.rom"}     # TYLKO ROM-y gry, bez cudzego
+        assert z.read("a1.rom") == a1 and z.read("a2.rom") == a2
+    assert merged.is_file()                       # ŹRÓDŁO merged NIE skasowane
+    with zipfile.ZipFile(merged) as z:
+        assert "clone/x1.rom" in z.namelist()     # cudzy rom nietknięty
+
+
+def test_incomplete_target_archive_overwritten_from_merged(tmp_path: Path):
+    """Cel ma ZŁY/niekompletny ZIP, a kompletne ROM-y są w nadzbiorze (merged)
+    w ToSort → naprawa NADPISUJE cel poprawnym zestawem (wypakowanym z merged),
+    a źródło merged ZOSTAJE (ma ROM-y innych gier). To był błąd: „plik był już
+    na miejscu i program nie mógł go nadpisać"."""
+    import zipfile
+    from chd_buddy.core.matcher import match_store
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    tosort = tmp_path / "ts"; tosort.mkdir()
+    a1 = b"GRA-ROM-1" * 100; a2 = b"GRA-ROM-2" * 100; x = b"CUDZY" * 100
+    _write_dat(dat_root / "sys" / "s.dat", "Sys",
+               {"gra": {"r1.rom": a1, "r2.rom": a2}})
+    # CEL: istniejący ZŁY gra.zip (brakuje r2, ma śmieć)
+    tdir = rom_root / "sys" / "Sys"; tdir.mkdir(parents=True)
+    with zipfile.ZipFile(tdir / "gra.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("r1.rom", a1)                 # tylko połowa + brak r2
+        z.writestr("smiec.rom", b"ZLE")
+    # ŹRÓDŁO: merged w ToSort z KOMPLETEM gra + cudzy plik
+    with zipfile.ZipFile(tosort / "merged.zip", "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("r1.rom", a1); z.writestr("r2.rom", a2)
+        z.writestr("other/x.rom", x)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root); idx.scan(tosort, full=True)
+    entries = DatStore(dat_root, rom_root).discover()
+    for e in entries:
+        e.store_format = "zip"
+
+    def rules_fn(e):
+        from chd_buddy.core.dirrules import DEFAULT_RULES
+        r = dict(DEFAULT_RULES); r["format"] = "zip"; return r
+    reports = match_store(entries, idx)
+    Rebuilder(idx, dry_run=False, log=lambda m: None).run(reports, rules=rules_fn)
+
+    with zipfile.ZipFile(tdir / "gra.zip") as z:
+        assert set(z.namelist()) == {"r1.rom", "r2.rom"}   # NADPISANY, kompletny
+        assert z.read("r2.rom") == a2 and "smiec.rom" not in z.namelist()
+    assert (tosort / "merged.zip").is_file()               # źródło merged zostało
+
+
+def test_clean_keeps_m3u_playlists(tmp_path: Path):
+    """Sprzątanie do ToSort NIE rusza playlist .m3u (nie ma ich w DAT, ale są
+    potrzebne i program sam je generuje)."""
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    tosort = tmp_path / "ts"; tosort.mkdir()
+    data = b"GRA-DISC" * 100
+    _write_dat(dat_root / "ps" / "p.dat", "Sony - PlayStation",
+               {"Gra (Disc 1)": {"Gra (Disc 1).chd": data}})
+    d = rom_root / "ps" / "Sony - PlayStation"; d.mkdir(parents=True)
+    (d / "Gra (Disc 1).chd").write_bytes(data)      # gra na miejscu (HAVE)
+    m3u = d / "Gra.m3u"; m3u.write_text("Gra (Disc 1).chd\n", encoding="utf-8")
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(rom_root)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    rb = Rebuilder(idx, tosort=tosort, dry_run=False, log=lambda m: None)
+    rb.run(reports, clean=True)
+    assert m3u.is_file()                            # playlista ZOSTAŁA
+    assert not (tosort / "Sony - PlayStation" / "Gra.m3u").exists()
+
+
+def test_parser_reads_mame_clone_merge():
+    """Parser jest świadomy MAME: czyta cloneof/romof gry oraz merge ROM-a."""
+    import tempfile
+    from chd_buddy.core.datfile import parse_dat
+    xml = ('<?xml version="1.0"?><datafile>'
+           '<machine name="darkseal1" cloneof="darkseal" romof="darkseal">'
+           '<rom name="fz_04-4.j12" size="131072" crc="a1a985a9"/>'
+           '<rom name="fz_00-2.h12" merge="ga_00.h12" size="131072" crc="fbf3ac63"/>'
+           '</machine></datafile>')
+    with tempfile.NamedTemporaryFile("w", suffix=".dat", delete=False,
+                                     encoding="utf-8") as f:
+        f.write(xml); p = f.name
+    games = list(parse_dat(Path(p)))
+    os.unlink(p)
+    assert len(games) == 1
+    g = games[0]
+    assert g.cloneof == "darkseal" and g.romof == "darkseal"
+    merges = {r.name: r.merge for r in g.roms}
+    assert merges["fz_00-2.h12"] == "ga_00.h12"      # współdzielony z parentem
+    assert merges["fz_04-4.j12"] == ""               # własny ROM klonu
+
+
+def test_dedup_never_deletes_file_moved_to_tosort_this_run(tmp_path: Path):
+    """UTRATA DANYCH (arcade klony): clean przeniósł plik roms→ToSort, a dedup
+    skasował go jako „już na miejscu" — choć to była jego JEDYNA kopia. Guard:
+    plik przeniesiony do ToSort w TYM przebiegu NIE jest kasowany przez dedup."""
+    roms = tmp_path / "roms"; roms.mkdir()
+    ts = tmp_path / "ts"; (ts / "sys").mkdir(parents=True)
+    data = b"KLON-ARCADE" * 100
+    canon = roms / "game.zip"; canon.write_bytes(data)   # „kanoniczny" (claim)
+    moved = ts / "sys" / "klon.zip"; moved.write_bytes(data)  # ta sama treść
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(roms); idx.scan(ts)
+
+    rb = Rebuilder(idx, dry_run=False, log=lambda m: None)
+    rb._claims["k"] = canon
+    rb._moved_to_tosort.add(os.path.normcase(str(moved)))   # clean go przeniósł
+    rb._dedup_confirmed([ts], [], delete_roots=[ts])
+    assert moved.is_file()                                  # NIE skasowany
+
+    # KONTROLA: bez oznaczenia „moved this run" — zwykła kopia w ToSort jest
+    # kasowana (kanoniczny fizycznie istnieje, więc to bezpieczne)
+    rb2 = Rebuilder(idx, dry_run=False, log=lambda m: None)
+    rb2._claims["k"] = canon
+    rb2._dedup_confirmed([ts], [], delete_roots=[ts])
+    assert not moved.exists()                               # skasowany (dup)
+
+
+def test_dedup_skips_when_canonical_file_missing(tmp_path: Path):
+    """Guard: gdy plik kanoniczny NIE istnieje fizycznie (ghost w indeksie),
+    dedup NIE kasuje kopii z ToSort (mogłaby to być jedyna kopia)."""
+    roms = tmp_path / "roms"; roms.mkdir()
+    ts = tmp_path / "ts"; (ts / "sys").mkdir(parents=True)
+    data = b"TRESC" * 100
+    canon = roms / "game.zip"; canon.write_bytes(data)
+    dup = ts / "sys" / "kopia.zip"; dup.write_bytes(data)
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(roms); idx.scan(ts)
+    canon.unlink()                                          # ghost: plik zniknął
+    rb = Rebuilder(idx, dry_run=False, log=lambda m: None)
+    rb._claims["k"] = canon
+    rb._dedup_confirmed([ts], [], delete_roots=[ts])
+    assert dup.is_file()                                    # NIE skasowany
+
+
+
+def test_restore_from_mega_zip_of_renamed_files(tmp_path: Path):
+    """Scenariusz usera: jeden ZIP z plikami RÓŻNYCH systemów pod LOSOWYMI
+    nazwami → program identyfikuje po TREŚCI i rozkłada każdy do właściwego
+    DAT-a z POPRAWNĄ nazwą. Treść nieznana → ToSort."""
+    import zipfile
+    from chd_buddy.core.matcher import match_store
+    dat_root = tmp_path / "dats"; rom_root = tmp_path / "roms"
+    tosort = tmp_path / "ts"; tosort.mkdir()
+    mario = b"SUPER-MARIO-NES" * 40
+    zelda = b"ZELDA-SNES-DANE" * 40
+    junk = b"NIEZNANE-NIGDZIE" * 40
+    _write_dat(dat_root / "nes" / "n.dat", "Nintendo - NES",
+               {"Super Mario Bros (USA)": {"Super Mario Bros (USA).nes": mario}})
+    _write_dat(dat_root / "snes" / "s.dat", "Nintendo - SNES",
+               {"Zelda (USA)": {"Zelda (USA).sfc": zelda}})
+    # jeden ZIP w ToSort: pliki obu systemów pod LOSOWYMI nazwami + śmieć
+    mega = tosort / "mega_losowe.zip"
+    with zipfile.ZipFile(mega, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("aaa111.xyz", mario)     # to jest Mario (NES)
+        z.writestr("bbb222.qqq", zelda)     # to jest Zelda (SNES)
+        z.writestr("smiec.dat", junk)       # nieznane
+    idx = FileIndex(tmp_path / "idx.sqlite3"); idx.scan(tosort, full=True)
+    entries = DatStore(dat_root, rom_root).discover()
+    reports = match_store(entries, idx)
+    rb = Rebuilder(idx, tosort=tosort, dry_run=False, log=lambda m: None)
+    rb.run(reports, clean=True)
+
+    nes = rom_root / "nes" / "Nintendo - NES" / "Super Mario Bros (USA).nes"
+    snes = rom_root / "snes" / "Nintendo - SNES" / "Zelda (USA).sfc"
+    assert nes.is_file() and nes.read_bytes() == mario   # NES: poprawna nazwa+miejsce
+    assert snes.is_file() and snes.read_bytes() == zelda  # SNES: j.w.
+    assert mega.is_file()                                 # źródło (nadzbiór) zostaje

@@ -61,6 +61,7 @@ class DatSettingsDialog(QDialog):
             "only_complete": bool(eff.get("only_complete", True)),
             "dedup_copies": bool(eff.get("dedup_copies", True)),
             "prefer_translations": bool(eff.get("prefer_translations", False)),
+            "role": eff.get("role", "collection"),
             "format": (inherited_format or "keep") if is_child
                       else eff.get("format", "keep"),
         }
@@ -125,6 +126,18 @@ class DatSettingsDialog(QDialog):
                   self.chk_trans):
             form.addRow("", c)
 
+        # ROLA DAT-u: zwykła kolekcja albo pula tłumaczeń
+        self.cmb_role = QComboBox()
+        self.cmb_role.addItem(tr("kolekcja (parent/child)"), "collection")
+        self.cmb_role.addItem(tr("tłumaczenia (pula wariantów do podmiany)"),
+                              "translations")
+        ri = self.cmb_role.findData(eff.get("role", "collection"))
+        self.cmb_role.setCurrentIndex(ri if ri >= 0 else 0)
+        self.cmb_role.setToolTip(tr(
+            "„tłumaczenia” = ten DAT to źródło fanowskich tłumaczeń; jego gry "
+            "służą do podmiany w innych DAT-ach (nie jest celem podstawowym)."))
+        form.addRow(tr("Rola DAT-u:"), self.cmb_role)
+
         if is_child:
             note_txt = tr("To DAT-DZIECKO swojej platformy — jego pliki to "
                         "symlinki do plików RODZICA, więc format jest "
@@ -178,6 +191,7 @@ class DatSettingsDialog(QDialog):
             "only_complete": self.chk_complete.isChecked(),
             "dedup_copies": self.chk_dedup.isChecked(),
             "prefer_translations": self.chk_trans.isChecked(),
+            "role": self.cmb_role.currentData(),
         }
         if not self.is_child:                 # dziecko dziedziczy format rodzica
             current["format"] = self.cmb_format.currentData()

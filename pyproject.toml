@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chd-buddy"
-version = "0.2.0"
+version = "0.3.0"
 description = "Audyt, konwersja i bezpieczna naprawa plików CHD (emulacja) — z wykrywaniem błędnego typu nośnika i trybem low-disk."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -22,8 +22,10 @@ dev = ["pytest>=8.0"]
 chd-buddy = "chd_buddy.cli:main"
 
 [project.gui-scripts]
+# Oba aliasy uruchamiają to samo okno (ROM Kombajn / SuiteWindow) — jedna
+# ścieżka startu w chd_buddy.main (crash-handler + auto-UAC dla symlinków).
 chd-buddy-gui = "chd_buddy.main:main"
-chd-buddy-suite = "chd_buddy.suite:main"
+chd-buddy-suite = "chd_buddy.main:main"
 
 [tool.setuptools.packages.find]
 include = ["chd_buddy*"]

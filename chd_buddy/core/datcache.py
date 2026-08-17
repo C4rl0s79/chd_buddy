@@ -20,7 +20,7 @@ from .datfile import DatGame, parse_dat, parse_dat_header
 from .settings import app_base_dir
 
 CACHE_FILENAME = "dat_parse_cache.pkl"
-CACHE_VERSION = 2
+CACHE_VERSION = 3      # v3: DatGame.cloneof/romof + DatRom.merge (MAME)
 
 REPORT_CACHE_FILENAME = "report_state_cache.pkl"
 REPORT_CACHE_VERSION = 4      # v4: + archive_names_ok (zła nazwa w archiwum)
