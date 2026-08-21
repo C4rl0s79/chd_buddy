@@ -24,11 +24,11 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="CHD Buddy",
+    name="ROM Helper",
     debug=False,
     strip=False,
     upx=True,
     console=False,          # GUI bez okna konsoli
     disable_windowed_traceback=False,
-    icon=None,              # ustaw ścieżkę do .ico jeśli masz
+    icon="assets/icon.ico",
 )

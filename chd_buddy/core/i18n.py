@@ -445,7 +445,7 @@ _EN: dict[str, str] = {
         "Could not download the full image.",
 
     # --- klasyczne narzędzie CHD (główne okno) ---
-    "CHD Buddy": "CHD Buddy",
+    "CHD Buddy": "ROM Helper",
     "📁  Przeciągnij tu pliki/foldery (CHD lub źródła)\n"
     "lub kliknij „Dodaj…”":
         "📁  Drag files/folders here (CHD or sources)\n"

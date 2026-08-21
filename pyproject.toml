@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chd-buddy"
-version = "0.3.0"
+version = "0.3.1"
 description = "Audyt, konwersja i bezpieczna naprawa plików CHD (emulacja) — z wykrywaniem błędnego typu nośnika i trybem low-disk."
 readme = "README.md"
 requires-python = ">=3.11"

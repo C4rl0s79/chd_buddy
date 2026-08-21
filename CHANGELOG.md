@@ -2,6 +2,19 @@
 
 Format: [semver](https://semver.org). Najnowsze na górze.
 
+## [0.3.1] — 2026-08-21
+
+### Zmienione
+- **Zmiana nazwy: CHD Buddy → ROM Helper** (branding). Tytuł okna to teraz
+  „ROM Helper"; repozytorium przemianowane na `RomHelper`. Pakiet i CLI pozostają
+  bez zmian (`chd_buddy` / `chd-buddy`) — zero zmian w importach/skryptach.
+- **Ikona aplikacji** — własna `.ico` (`assets/icon.ico`, kartridż + zębatka)
+  wpięta w build (`chd_buddy.spec`); `.exe` nazywa się teraz `ROM Helper.exe`.
+
+### Dokumentacja
+- README: sekcja **„Wymagane narzędzia zewnętrzne"** (chdman/MAME wymagane,
+  7-Zip opcjonalnie, DolphinTool dla RVZ).
+
 ## [0.3.0] — 2026-08-09
 
 ### Dodane — Tłumaczenia (V1, gry jednoplikowe)

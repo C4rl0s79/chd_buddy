@@ -1,4 +1,6 @@
-# CHD Buddy
+# ROM Helper
+
+> Dawniej **CHD Buddy**. Pakiet/CLI pozostają `chd_buddy` / `chd-buddy`.
 
 Desktopowe narzędzie (Python) do **audytu, konwersji i bezpiecznej naprawy**
 plików CHD z naciskiem na poprawność typu nośnika, sekwencyjną rekompresję
@@ -38,6 +40,26 @@ chd-buddy-gui                  # GUI  (lub: python -m chd_buddy.main)
 ```
 
 `chdman` musi być w PATH albo wskazany w ustawieniach (przenośnych, obok exe).
+
+## Wymagane narzędzia zewnętrzne
+
+CHD Buddy jest **wrapperem** wokół zewnętrznych narzędzi — sam ich nie zawiera.
+Zainstaluj/wskaż te, których używasz (ścieżki konfigurowalne w Ustawieniach,
+przenośnie obok `.exe`):
+
+| Narzędzie | Do czego | Wymagane? |
+|---|---|---|
+| **chdman** (MAME) | wszystkie operacje na CHD: `info/verify/create*/extract*/copy`, identyfikacja zawartości | **Tak** (rdzeń programu) — w PATH lub w ustawieniach |
+| **7-Zip** (`7z.exe`) | odczyt/rozpakowanie archiwów `.7z` (skan kolekcji, aktualizacje emulatorów) | Zalecane, gdy używasz `.7z` |
+| **DolphinTool** (`dolphin-tool.exe`) | konwersja i weryfikacja **RVZ** (GameCube/Wii) | Tylko dla RVZ |
+
+`chdman` i `dolphin-tool` pochodzą odpowiednio z pakietu **MAME** oraz z
+**Dolphina**. Na Windows symlinki (dedup/mirror) wymagają trybu dewelopera lub
+uruchomienia jako administrator.
+
+**Zależności Pythona** (opcjonalne ekstra przy `pip install`):
+`PySide6` (GUI, `.[gui]`), `requests` (aktualizator emulatorów), `Pillow`
+(ikony, `.[icons]`), `py7zr` (archiwa 7z bez `7z.exe`, `.[archives]`).
 
 ## Przykłady CLI
 
